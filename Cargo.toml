@@ -1,0 +1,7 @@
+[package]
+name = "VWFL"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+object = { version = "0.32.2", features = ["pe"] }
