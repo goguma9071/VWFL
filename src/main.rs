@@ -5,7 +5,7 @@ use std::process;
 mod pe;
 mod vm;
 mod loader;
-mod cpu; // cpu 모듈 선언
+mod cpu; 
 
 fn main() {
     let args: Vec<String> = env::args().collect();

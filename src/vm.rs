@@ -5,9 +5,25 @@ pub const SERIAL_PORT_ADDRESS: u64 = 0x10000000;
 #[derive(Debug)]
 pub struct Vm {
 //... (이 부분은 이전과 동일)
-    memory: Vec<u8>,
-    pub rip: u64,    // Instruction Pointer (명령어 포인터)
-    // 나중에 스택 포인터 (rsp), 일반 목적 레지스터 등도 추가될 수 있습니다.
+    pub memory: Vec<u8>,
+    pub rip: u64,
+    // General-purpose registers
+    pub rax: u64,
+    pub rbx: u64,
+    pub rcx: u64,
+    pub rdx: u64,
+    pub rsi: u64,
+    pub rdi: u64,
+    pub rbp: u64,
+    pub rsp: u64,
+    pub r8: u64,
+    pub r9: u64,
+    pub r10: u64,
+    pub r11: u64,
+    pub r12: u64,
+    pub r13: u64,
+    pub r14: u64,
+    pub r15: u64,
 }
 
 impl Vm {

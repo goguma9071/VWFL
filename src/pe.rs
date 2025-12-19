@@ -84,7 +84,7 @@ impl PeFile {
     }
 }
 
-// 디버깅 출력을 보기 좋게 하기 위한 `Display` 트레잇 구현
+// 디버깅 출력을 보기 좋게 하기 위한 Display 트레잇 구현
 impl fmt::Display for PeFile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "PE File Info:")?;
