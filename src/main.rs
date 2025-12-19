@@ -31,8 +31,12 @@ fn main() {
             println!("{}", pe_file);
             
             // 1. 가상 머신 생성
-            const MEM_SIZE: usize = 1024 * 1024 * 256;
+            const MEM_SIZE: usize = 1024 * 1024 * 512;
             let mut vm = vm::Vm::new(MEM_SIZE);
+            
+            // 스택 포인터 (RSP) 초기화: 메모리 끝 주소에서 약간 아래로 설정 (여유 공간 확보)
+            vm.rsp = MEM_SIZE as u64 - 0x1000;
+            println!("Stack pointer (RSP) initialized to: 0x{:016x}", vm.rsp);
 
             // 2. 섹션들을 메모리에 적재
             println!("\nLoading sections into memory...");

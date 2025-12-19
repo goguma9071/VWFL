@@ -4,7 +4,7 @@ pub const SERIAL_PORT_ADDRESS: u64 = 0x10000000;
 
 #[derive(Debug)]
 pub struct Vm {
-//... (이 부분은 이전과 동일)
+
     pub memory: Vec<u8>,
     pub rip: u64,
     // General-purpose registers
@@ -24,15 +24,33 @@ pub struct Vm {
     pub r13: u64,
     pub r14: u64,
     pub r15: u64,
+    pub rflags: u64,
 }
 
 impl Vm {
-//... (new, read_byte 함수는 이전과 동일)
+
     pub fn new(memory_size: usize) -> Self {
         Vm {
             memory: vec![0; memory_size],
             rip: 0,
-        }
+            rax: 0,
+            rbx: 0,
+            rcx: 0,
+            rdx: 0,
+            rsi: 0,
+            rdi: 0,
+            rbp: 0,
+            rsp: 0,
+            r8: 0,
+            r9: 0,
+            r10: 0,
+            r11: 0,
+            r12: 0,
+            r13: 0,
+            r14: 0,
+            r15: 0,
+            rflags: 0,
+            }
     }
 
     pub fn read_byte(&self, address: u64) -> Result<u8, &'static str> {
@@ -56,6 +74,26 @@ impl Vm {
             return Err("Address out of range (write)");
         }
         self.memory[address as usize] = value;
+        Ok(())
+    }
+
+    /// 지정된 주소에서 8바이트(qword)를 읽어 u64로 반환
+    pub fn read_qword(&self, address: u64) -> Result<u64, &'static str> {
+        let addr = address as usize;
+        if addr + 8 > self.memory.len() {
+            return Err("Memory access out of bounds (read_qword)");
+        }
+        let bytes: [u8; 8] = self.memory[addr..addr + 8].try_into().unwrap();
+        Ok(u64::from_le_bytes(bytes))
+    }
+
+    /// 지정된 주소에 u64 값을 8바이트(qword)로 씀
+    pub fn write_qword(&mut self, address: u64, value: u64) -> Result<(), &'static str> {
+        let addr = address as usize;
+        if addr + 8 > self.memory.len() {
+            return Err("Memory access out of bounds (write_qword)");
+        }
+        self.memory[addr..addr + 8].copy_from_slice(&value.to_le_bytes());
         Ok(())
     }
 }
