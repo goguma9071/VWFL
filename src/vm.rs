@@ -96,4 +96,17 @@ impl Vm {
         self.memory[addr..addr + 8].copy_from_slice(&value.to_le_bytes());
         Ok(())
     }
+
+    /// 스택에 값을 넣음 (RSP 감소 후 쓰기)
+    pub fn push(&mut self, value: u64) -> Result<(), &'static str> {
+        self.rsp = self.rsp.wrapping_sub(8);
+        self.write_qword(self.rsp, value)
+    }
+
+    /// 스택에서 값을 꺼냄 (읽은 후 RSP 증가)
+    pub fn pop(&mut self) -> Result<u64, &'static str> {
+        let value = self.read_qword(self.rsp)?;
+        self.rsp = self.rsp.wrapping_add(8);
+        Ok(value)
+    }
 }

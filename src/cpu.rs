@@ -62,6 +62,51 @@ pub fn run(vm: &mut Vm) -> Result<(), &'static str> {
                     _ => println!("Unsupported INC on register {:?}", instruction.op0_register()),
                 }
             }
+            Code::Call_rel32_64 => {
+                let return_address = vm.rip + instruction_len as u64;
+                vm.push(return_address)?;
+                let target = instruction.near_branch_target();
+                vm.rip = target;
+                println!("    CALL 0x{:016x}", target);
+                continue;
+            }
+
+            // RET (Near return): 스택에서 복귀 주소를 꺼내 RIP로 이동
+            Code::Retnq => {
+                let return_address = vm.pop()?;
+                vm.rip = return_address;
+                println!("    RET 0x{:016x}", return_address);
+                continue;
+            }
+
+            Code::And_rm64_imm8 => {
+                let imm = instruction.immediate8() as u64;
+                let reg = instruction.op0_register();
+
+                match instruction.op0_kind() {
+                    OpKind::Register => {
+                        let reg = instruction.op0_register();
+                        let old_val = get_register_value(vm, reg);
+                        let result = old_val & imm;
+                        set_register_value(vm, reg, result);  
+                        //todo: RFLAGS 업데이트
+                        println!("AND {:?}, 0x{:x} -> result 0x{:x}", reg, imm, result);
+                    }
+                    OpKind::Memory => {
+                        let addr = calculate_memory_address(vm, &instruction);
+                        let old_val = vm.read_qword(addr)?;
+                        let result = old_val & imm;
+                        vm.write_qword(addr, result)?;
+                        //todo: RFLAGS 업데이트
+                        println!("AND [0x{:x}], 0x{:x} -> result 0x{:x}", addr, imm, result);
+                    }
+                    _ => {
+                        println!("    --> Unhandled AND_rm64_imm8 operand kind.");
+                    }
+                               
+            }
+
+        }
             // MOV r64, imm64
             Code::Mov_r64_imm64 => {
                 let reg = instruction.op0_register();
@@ -109,6 +154,23 @@ pub fn run(vm: &mut Vm) -> Result<(), &'static str> {
                     Register::R15D => vm.r15 = imm,
                     _ => println!("Unsupported MOV on register {:?}", reg),
                 }
+            }
+            // MOV r32, rm32 (예: mov eax, ebx 또는 mov eax, [rbp+20h])
+            Code::Mov_r32_rm32 => {
+                let dst_reg = instruction.op0_register();
+                let src_value = match instruction.op1_kind() {
+                    OpKind::Register => get_register_value(vm, instruction.op1_register()) & 0xFFFFFFFF,
+                    OpKind::Memory => {
+                        let addr = calculate_memory_address(vm, &instruction);
+                        vm.read_qword(addr)? & 0xFFFFFFFF
+                    }
+                    _ => {
+                        println!("    --> Unhandled MOV_r32_rm32: Unexpected source operand kind.");
+                        0
+                    }
+                };
+                set_register_value(vm, dst_reg, src_value);
+                println!("    MOV {:?} <- 0x{:08x}", dst_reg, src_value);
             }
             // SUB r64, imm8/imm32
             Code::Sub_rm64_imm8 | Code::Sub_rm64_imm32 => {
@@ -184,40 +246,63 @@ pub fn run(vm: &mut Vm) -> Result<(), &'static str> {
                 set_register_value(vm, dst_reg, effective_address);
                 println!("    LEA {:?} <- 0x{:016x}", dst_reg, effective_address);
             }
-            // CALL_rel32_64 (CALL, 상대 주소)
-            Code::Call_rel32_64 => {
-                let return_address = vm.rip + instruction_len as u64;
-                vm.rsp = vm.rsp.wrapping_sub(8); // 스택 공간 확보
-                vm.write_qword(vm.rsp, return_address)?; // 스택에 돌아올 주소 저장
-                let target = instruction.near_branch_target();
-                println!("    Calling 0x{:016x}, return to 0x{:016x}", target, return_address);
-                vm.rip = target;
-                continue;
+            // XOR r64, rm64 (레지스터와 레지스터/메모리 XOR 연산)
+            Code::Xor_r64_rm64 => {
+                let dst_reg = instruction.op0_register();
+                let val1 = get_register_value(vm, dst_reg);
+
+                let src_val = match instruction.op1_kind() {
+                    OpKind::Register => get_register_value(vm, instruction.op1_register()),
+                    OpKind::Memory => {
+                        let addr = calculate_memory_address(vm, &instruction);
+                        vm.read_qword(addr)?
+                    }
+                    _ => {
+                        println!("    --> Unhandled XOR_r64_rm64: Unexpected source operand kind.");
+                        0 // Fallback, should not happen for valid x86
+                    }
+                };
+                let result = val1 ^ src_val;
+                set_register_value(vm, dst_reg, result);
+                println!("    XOR {:?} (0x{:016x}) ^ {:?} (0x{:016x}) -> {:?} (0x{:016x})", 
+                         dst_reg, val1, instruction.op1_register(), src_val, dst_reg, result);
+                // TODO: XOR 연산에 따른 RFLAGS 업데이트 (ZF, SF, PF 등)
             }
-            // RETnq (RET, 함수에서 돌아옴)
-            Code::Retnq => {
-                let return_address = vm.read_qword(vm.rsp)?; // 스택에서 돌아올 주소 읽기
-                vm.rsp = vm.rsp.wrapping_add(8); // 스택 공간 정리
-                println!("    Returning to 0x{:016x}", return_address);
-                vm.rip = return_address;
-                continue;
+            // XOR r32, rm32 (32비트 레지스터와 레지스터/메모리 XOR 연산)
+            Code::Xor_r32_rm32 => {
+                let dst_reg = instruction.op0_register();
+                let val1 = get_register_value(vm, dst_reg) & 0xFFFFFFFF; // 32비트 값으로 마스킹
+                
+                let src_val = match instruction.op1_kind() {
+                    OpKind::Register => get_register_value(vm, instruction.op1_register()) & 0xFFFFFFFF,
+                    OpKind::Memory => {
+                        let addr = calculate_memory_address(vm, &instruction);
+                        vm.read_qword(addr)? & 0xFFFFFFFF // 32비트 값으로 마스킹
+                    }
+                    _ => {
+                        println!("    --> Unhandled XOR_r32_rm32: Unexpected source operand kind.");
+                        0 // Fallback
+                    }
+                };
+                let result = val1 ^ src_val;
+                set_register_value(vm, dst_reg, result as u64); // 64비트 레지스터의 하위 32비트만 업데이트
+                println!("    XOR {:?} (0x{:08x}) ^ {:?} (0x{:08x}) -> {:?} (0x{:08x})", 
+                         dst_reg, val1, instruction.op1_register(), src_val, dst_reg, result);
+                // TODO: RFLAGS 업데이트 (ZF, SF, PF 등)
             }
-            Code::Call_rm64 => { // 레지스터나 메모리 참조를 통한 CALL - 일단 Unhandled
-                println!("    --> Unhandled Instruction: Call_rm64. Complex call type, skipping for now.");
-            }
+            // Call_rm64 (레지스터나 메모리 참조를 통한 CALL - 일단 Unhandled)
+
             // PUSH r64 (예: push rbp)
             Code::Push_r64 => {
                 let reg = instruction.op0_register();
                 let value_to_push = get_register_value(vm, reg);
-                vm.rsp = vm.rsp.wrapping_sub(8); // 스택 공간 확보
-                vm.write_qword(vm.rsp, value_to_push)?;
+                vm.push(value_to_push)?;
                 println!("    PUSH {:?} (0x{:016x}) -> RSP: 0x{:016x}", reg, value_to_push, vm.rsp);
             }
             // POP r64 (예: pop rbp)
             Code::Pop_r64 => {
                 let reg = instruction.op0_register();
-                let popped_value = vm.read_qword(vm.rsp)?; // 스택에서 값 읽기
-                vm.rsp = vm.rsp.wrapping_add(8); // 스택 공간 정리
+                let popped_value = vm.pop()?;
                 set_register_value(vm, reg, popped_value);
                 println!("    POP {:?} (0x{:016x}) -> RSP: 0x{:016x}", reg, popped_value, vm.rsp);
             }
@@ -277,6 +362,73 @@ pub fn run(vm: &mut Vm) -> Result<(), &'static str> {
                     println!("    --> Unhandled MOV_rm64_r64: Destination is not memory.");
                 }
             }
+            // Call_rm64 (레지스터나 메모리 참조를 통한 CALL - 일단 Unhandled)
+            Code::Call_rm64 => {
+                println!("    --> Unhandled Instruction: Call_rm64. Complex call type, skipping for now.");
+            }
+            // TEST r/m64, r64 (예: test rax, rax)
+            Code::Test_rm64_r64 => {
+                let val1 = match instruction.op0_kind() {
+                    OpKind::Register => get_register_value(vm, instruction.op0_register()),
+                    OpKind::Memory => {
+                        let addr = calculate_memory_address(vm, &instruction);
+                        vm.read_qword(addr)?
+                    }
+                    _ => {
+                        println!("    --> Unhandled TEST_rm64_r64: Unexpected op0 kind.");
+                        0
+                    }
+                };
+                let val2 = get_register_value(vm, instruction.op1_register());
+                let result = val1 & val2;
+
+                if result == 0 {
+                    vm.rflags |= ZERO_FLAG_MASK;
+                } else {
+                    vm.rflags &= !ZERO_FLAG_MASK;
+                }
+                println!("    TEST {:?} & {:?} -> result: {}, ZF set to {}", instruction.op0_register(), instruction.op1_register(), result, (vm.rflags & ZERO_FLAG_MASK) != 0);
+            }
+            // TEST r/m32, r32 (예: test ecx, ecx)
+            Code::Test_rm32_r32 => {
+                let val1 = match instruction.op0_kind() {
+                    OpKind::Register => get_register_value(vm, instruction.op0_register()),
+                    OpKind::Memory => vm.read_qword(calculate_memory_address(vm, &instruction))?,
+                    _ => {
+                        println!("    --> Unhandled TEST_rm32_r32: Unexpected op0 kind.");
+                        0
+                    }
+                } & 0xFFFFFFFF;
+                let val2 = get_register_value(vm, instruction.op1_register()) & 0xFFFFFFFF;
+                let result = val1 & val2;
+
+                if result == 0 {
+                    vm.rflags |= ZERO_FLAG_MASK;
+                } else {
+                    vm.rflags &= !ZERO_FLAG_MASK;
+                }
+                println!("    TEST {:?} & {:?} -> result: {}, ZF set to {}", instruction.op0_register(), instruction.op1_register(), result, (vm.rflags & ZERO_FLAG_MASK) != 0);
+            }
+            // TEST r/m8, r8 (예: test al, al)
+            Code::Test_rm8_r8 => {
+                let val1 = match instruction.op0_kind() {
+                    OpKind::Register => get_register_value(vm, instruction.op0_register()) & 0xFF,
+                    OpKind::Memory => vm.read_byte(calculate_memory_address(vm, &instruction))? as u64,
+                    _ => {
+                        println!("    --> Unhandled TEST_rm8_r8: Unexpected op0 kind.");
+                        0
+                    }
+                };
+                let val2 = get_register_value(vm, instruction.op1_register()) & 0xFF;
+                let result = val1 & val2;
+
+                if result == 0 {
+                    vm.rflags |= ZERO_FLAG_MASK;
+                } else {
+                    vm.rflags &= !ZERO_FLAG_MASK;
+                }
+                println!("    TEST {:?} & {:?} -> result: {}, ZF set to {}", instruction.op0_register(), instruction.op1_register(), result, (vm.rflags & ZERO_FLAG_MASK) != 0);
+            }
             _ => {
                 println!("    --> Unhandled Instruction: {:?}", instruction.code());
             }
@@ -318,6 +470,29 @@ fn get_register_value(vm: &Vm, reg: Register) -> u64 {
         Register::R13 => vm.r13,
         Register::R14 => vm.r14,
         Register::R15 => vm.r15,
+        // 8비트 레지스터 (AL, CL, DL, BL, AH, CH, DH, BH, SPL, BPL, SIL, DIL, R8B-R15L)
+        // 하위 8비트
+        Register::AL => vm.rax & 0xFF,
+        Register::CL => vm.rcx & 0xFF,
+        Register::DL => vm.rdx & 0xFF,
+        Register::BL => vm.rbx & 0xFF,
+        Register::SPL => vm.rsp & 0xFF,
+        Register::BPL => vm.rbp & 0xFF,
+        Register::SIL => vm.rsi & 0xFF,
+        Register::DIL => vm.rdi & 0xFF,
+        Register::R8L => vm.r8 & 0xFF,
+        Register::R9L => vm.r9 & 0xFF,
+        Register::R10L => vm.r10 & 0xFF,
+        Register::R11L => vm.r11 & 0xFF,
+        Register::R12L => vm.r12 & 0xFF,
+        Register::R13L => vm.r13 & 0xFF,
+        Register::R14L => vm.r14 & 0xFF,
+        Register::R15L => vm.r15 & 0xFF,
+        // 상위 8비트 (AH, CH, DH, BH)
+        Register::AH => (vm.rax >> 8) & 0xFF,
+        Register::CH => (vm.rcx >> 8) & 0xFF,
+        Register::DH => (vm.rdx >> 8) & 0xFF,
+        Register::BH => (vm.rbx >> 8) & 0xFF,
         // 32비트 레지스터(EAX 등)가 들어오면 해당 64비트 레지스터의 하위 32비트만 반환
         // 지금은 편의상 64비트 값을 반환하되, 나중에 확장될 수 있음
         Register::EAX => vm.rax & 0xFFFFFFFF,
@@ -363,6 +538,29 @@ fn set_register_value(vm: &mut Vm, reg: Register, value: u64) {
         Register::R13 => vm.r13 = value,
         Register::R14 => vm.r14 = value,
         Register::R15 => vm.r15 = value,
+        // 8비트 레지스터 (AL, CL, DL, BL, AH, CH, DH, BH, SPL, BPL, SIL, DIL, R8B-R15B)
+        // 하위 8비트
+        Register::AL => vm.rax = (vm.rax & !0xFF) | (value & 0xFF),
+        Register::CL => vm.rcx = (vm.rcx & !0xFF) | (value & 0xFF),
+        Register::DL => vm.rdx = (vm.rdx & !0xFF) | (value & 0xFF),
+        Register::BL => vm.rbx = (vm.rbx & !0xFF) | (value & 0xFF),
+        Register::SPL => vm.rsp = (vm.rsp & !0xFF) | (value & 0xFF),
+        Register::BPL => vm.rbp = (vm.rbp & !0xFF) | (value & 0xFF),
+        Register::SIL => vm.rsi = (vm.rsi & !0xFF) | (value & 0xFF),
+        Register::DIL => vm.rdi = (vm.rdi & !0xFF) | (value & 0xFF),
+        Register::R8L => vm.r8 = (vm.r8 & !0xFF) | (value & 0xFF),
+        Register::R9L => vm.r9 = (vm.r9 & !0xFF) | (value & 0xFF),
+        Register::R10L => vm.r10 = (vm.r10 & !0xFF) | (value & 0xFF),
+        Register::R11L => vm.r11 = (vm.r11 & !0xFF) | (value & 0xFF),
+        Register::R12L => vm.r12 = (vm.r12 & !0xFF) | (value & 0xFF),
+        Register::R13L => vm.r13 = (vm.r13 & !0xFF) | (value & 0xFF),
+        Register::R14L => vm.r14 = (vm.r14 & !0xFF) | (value & 0xFF),
+        Register::R15L => vm.r15 = (vm.r15 & !0xFF) | (value & 0xFF),
+        // 상위 8비트 (AH, CH, DH, BH)
+        Register::AH => vm.rax = (vm.rax & !0xFF00) | ((value & 0xFF) << 8),
+        Register::CH => vm.rcx = (vm.rcx & !0xFF00) | ((value & 0xFF) << 8),
+        Register::DH => vm.rdx = (vm.rdx & !0xFF00) | ((value & 0xFF) << 8),
+        Register::BH => vm.rbx = (vm.rbx & !0xFF00) | ((value & 0xFF) << 8),
         // 32비트 레지스터에 쓸 때는 상위 32비트 0 처리 (자동 확장)
         Register::EAX => vm.rax = value & 0xFFFFFFFF,
         Register::ECX => vm.rcx = value & 0xFFFFFFFF,
@@ -408,4 +606,3 @@ fn calculate_memory_address(vm: &Vm, instruction: &Instruction) -> u64 {
         addr.wrapping_add(displ)
     }
 }
-
