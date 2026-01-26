@@ -1,112 +1,90 @@
-use std::io::{self, Write};
+use kvm_ioctls::{Kvm, VmFd, VcpuFd};
+use kvm_bindings::{kvm_userspace_memory_region, KVM_MEM_LOG_DIRTY_PAGES};
+use std::ptr;
 
-pub const SERIAL_PORT_ADDRESS: u64 = 0x10000000;
+pub const MEM_SIZE: usize = 1024 * 1024 * 1024; // 1GB Memory
+pub const SERIAL_PORT_ADDRESS: u64 = 0x10000000; // 가상 시리얼 포트 주소 (MMIO)
 
-#[derive(Debug)]
 pub struct Vm {
+    #[allow(dead_code)]
+    pub kvm: Kvm,
+    #[allow(dead_code)]
+    pub vm_fd: VmFd,
+    pub vcpu_fd: VcpuFd,
+    pub mem_ptr: *mut u8, // 할당된 실제 메모리의 포인터
+    pub mem_size: usize,
+}
 
-    pub memory: Vec<u8>,
-    pub rip: u64,
-    // General-purpose registers
-    pub rax: u64,
-    pub rbx: u64,
-    pub rcx: u64,
-    pub rdx: u64,
-    pub rsi: u64,
-    pub rdi: u64,
-    pub rbp: u64,
-    pub rsp: u64,
-    pub r8: u64,
-    pub r9: u64,
-    pub r10: u64,
-    pub r11: u64,
-    pub r12: u64,
-    pub r13: u64,
-    pub r14: u64,
-    pub r15: u64,
-    pub rflags: u64,
+// 메모리 자동 해제를 위한 Drop 구현
+impl Drop for Vm {
+    fn drop(&mut self) {
+        unsafe {
+            // mmap으로 할당했던 메모리를 해제
+            libc::munmap(self.mem_ptr as *mut libc::c_void, self.mem_size);
+        }
+    }
 }
 
 impl Vm {
+    pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        // 1. KVM 열기
+        let kvm = Kvm::new()?;
 
-    pub fn new(memory_size: usize) -> Self {
-        Vm {
-            memory: vec![0; memory_size],
-            rip: 0,
-            rax: 0,
-            rbx: 0,
-            rcx: 0,
-            rdx: 0,
-            rsi: 0,
-            rdi: 0,
-            rbp: 0,
-            rsp: 0,
-            r8: 0,
-            r9: 0,
-            r10: 0,
-            r11: 0,
-            r12: 0,
-            r13: 0,
-            r14: 0,
-            r15: 0,
-            rflags: 0,
-            }
+        // 2. VM 생성
+        let vm_fd = kvm.create_vm()?;
+
+        // 3. 메모리 할당 (mmap 사용)
+        let mem_size = MEM_SIZE;
+        let mem_ptr = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                mem_size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANONYMOUS | libc::MAP_SHARED | libc::MAP_NORESERVE,
+                -1,
+                0,
+            ) as *mut u8
+        };
+
+        if mem_ptr == ptr::null_mut() {
+            return Err("Failed to mmap memory".into());
+        }
+
+        // 4. KVM에 메모리 등록 (Slot 0에 매핑)
+        let mem_region = kvm_userspace_memory_region {
+            slot: 0,
+            guest_phys_addr: 0,
+            memory_size: mem_size as u64,
+            userspace_addr: mem_ptr as u64,
+            flags: KVM_MEM_LOG_DIRTY_PAGES, // (선택) 메모리 변경 추적
+        };
+
+        unsafe {
+            vm_fd.set_user_memory_region(mem_region)?;
+        }
+
+        // 5. vCPU 생성 (ID: 0)
+        let vcpu_fd = vm_fd.create_vcpu(0)?;
+
+        Ok(Vm {
+            kvm,
+            vm_fd,
+            vcpu_fd,
+            mem_ptr,
+            mem_size,
+        })
     }
 
-    pub fn read_byte(&self, address: u64) -> Result<u8, &'static str> {
-        if address as usize >= self.memory.len() {
-            return Err("Address out of range (read)");
+    /// 가상 메모리에 데이터 쓰기
+    pub fn write_memory(&mut self, offset: usize, data: &[u8]) -> Result<(), &'static str> {
+        if offset + data.len() > self.mem_size {
+            return Err("Memory write out of bounds");
         }
-        Ok(self.memory[address as usize])
-    }
-
-    pub fn write_byte(&mut self, address: u64, value: u8) -> Result<(), &'static str> {
-        // MMIO: Check if the address is our magic serial port address
-        if address == SERIAL_PORT_ADDRESS {
-            // Print the character to the console
-            print!("{}", value as char);
-            // Flush stdout to ensure the character appears immediately
-            io::stdout().flush().unwrap();
-            return Ok(());
+        unsafe {
+            // mem_ptr + offset 위치에 data 복사
+            let dest = self.mem_ptr.add(offset);
+            ptr::copy_nonoverlapping(data.as_ptr(), dest, data.len());
         }
-
-        if address as usize >= self.memory.len() {
-            return Err("Address out of range (write)");
-        }
-        self.memory[address as usize] = value;
         Ok(())
-    }
-
-    /// 지정된 주소에서 8바이트(qword)를 읽어 u64로 반환
-    pub fn read_qword(&self, address: u64) -> Result<u64, &'static str> {
-        let addr = address as usize;
-        if addr + 8 > self.memory.len() {
-            return Err("Memory access out of bounds (read_qword)");
-        }
-        let bytes: [u8; 8] = self.memory[addr..addr + 8].try_into().unwrap();
-        Ok(u64::from_le_bytes(bytes))
-    }
-
-    /// 지정된 주소에 u64 값을 8바이트(qword)로 씀
-    pub fn write_qword(&mut self, address: u64, value: u64) -> Result<(), &'static str> {
-        let addr = address as usize;
-        if addr + 8 > self.memory.len() {
-            return Err("Memory access out of bounds (write_qword)");
-        }
-        self.memory[addr..addr + 8].copy_from_slice(&value.to_le_bytes());
-        Ok(())
-    }
-
-    /// 스택에 값을 넣음 (RSP 감소 후 쓰기)
-    pub fn push(&mut self, value: u64) -> Result<(), &'static str> {
-        self.rsp = self.rsp.wrapping_sub(8);
-        self.write_qword(self.rsp, value)
-    }
-
-    /// 스택에서 값을 꺼냄 (읽은 후 RSP 증가)
-    pub fn pop(&mut self) -> Result<u64, &'static str> {
-        let value = self.read_qword(self.rsp)?;
-        self.rsp = self.rsp.wrapping_add(8);
-        Ok(value)
     }
 }
