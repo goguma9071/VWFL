@@ -19,6 +19,7 @@ pub struct PeFile {
     pub architecture: Architecture,
     pub image_base: u64,
     pub sections: Vec<Section>,
+    pub pdb_name: String, // 추가: PDB 이름을 통해 버전 유추 가능
 }
 
 /// 외부에서 호출할 수 있는 파싱 함수
@@ -30,10 +31,15 @@ impl PeFile {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, &'static str> {
         let file = File::parse(bytes).map_err(|_| "Failed to parse file: not a valid object file")?;
 
+        // PDB 이름 추출 시도
+        let pdb_name = match file.pdb_info() {
+            Ok(Some(info)) => String::from_utf8_lossy(info.path()).to_string(),
+            _ => "Unknown".to_string(),
+        };
+
         let (entry_point, architecture, image_base, sections) = match file {
             File::Pe32(pe) => {
                 let sections = Self::extract_sections(&pe)?;
-                // object 0.32+ 에서 image_base 가져오기
                 let image_base = pe.nt_headers().optional_header.image_base.get(LittleEndian) as u64;
                 (pe.entry(), pe.architecture(), image_base, sections)
             }
@@ -50,11 +56,12 @@ impl PeFile {
             architecture,
             image_base,
             sections,
+            pdb_name,
         })
     }
 
     /// `object`의 섹션 정보로부터 필요한 정보만 뽑아서 `Vec<Section>` 생성
-    fn extract_sections<'data: 'file, 'file, O: Object<'data, 'file>>(
+    fn extract_sections<'data: 'file, 'file, O: Object<'data,>>(
         object_file: &'file O,
     ) -> Result<Vec<Section>, &'static str> {
         let mut sections = Vec::new();

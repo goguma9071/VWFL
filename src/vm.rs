@@ -63,7 +63,11 @@ impl Vm {
             vm_fd.set_user_memory_region(mem_region)?;
         }
 
-        // 5. vCPU 생성 (ID: 0)
+        // 5. 가상 인터럽트 컨트롤러(IRQCHIP) 및 타이머(PIT) 생성 (윈도우 필수)
+        vm_fd.create_irq_chip()?;
+        vm_fd.create_pit2(kvm_bindings::kvm_pit_config::default())?;
+
+        // 6. vCPU 생성 (ID: 0)
         let vcpu_fd = vm_fd.create_vcpu(0)?;
 
         Ok(Vm {
