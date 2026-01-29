@@ -19,7 +19,8 @@ pub struct PeFile {
     pub architecture: Architecture,
     pub image_base: u64,
     pub sections: Vec<Section>,
-    pub pdb_name: String, // 추가: PDB 이름을 통해 버전 유추 가능
+    pub pdb_name: String,
+    pub pdb_guid_age: String, // 추가: PDB를 다운로드하기 위한 식별자
 }
 
 /// 외부에서 호출할 수 있는 파싱 함수
@@ -31,10 +32,19 @@ impl PeFile {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, &'static str> {
         let file = File::parse(bytes).map_err(|_| "Failed to parse file: not a valid object file")?;
 
-        // PDB 이름 추출 시도
-        let pdb_name = match file.pdb_info() {
-            Ok(Some(info)) => String::from_utf8_lossy(info.path()).to_string(),
-            _ => "Unknown".to_string(),
+        // PDB 정보(GUID, Age) 추출
+        let (pdb_name, pdb_guid_age) = match file.pdb_info() {
+            Ok(Some(info)) => {
+                let name = String::from_utf8_lossy(info.path()).to_string();
+                let guid = info.guid();
+                let guid_str = format!(
+                    "{:08X}{:04X}{:04X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:X}",
+                    guid[0], guid[1], guid[2], guid[3], guid[4], guid[5], guid[6], guid[7], guid[8], guid[9], guid[10],
+                    info.age()
+                );
+                (name, guid_str)
+            }
+            _ => ("Unknown".to_string(), "Unknown".to_string()),
         };
 
         let (entry_point, architecture, image_base, sections) = match file {
@@ -57,6 +67,7 @@ impl PeFile {
             image_base,
             sections,
             pdb_name,
+            pdb_guid_age,
         })
     }
 
