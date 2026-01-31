@@ -2,7 +2,7 @@ use kvm_ioctls::{Kvm, VmFd, VcpuFd};
 use kvm_bindings::{kvm_userspace_memory_region, KVM_MEM_LOG_DIRTY_PAGES};
 use std::ptr;
 
-pub const MEM_SIZE: usize = 1024 * 1024 * 1024; // 1GB Memory
+pub const MEM_SIZE: usize = 8 * 1024 * 1024 * 1024; // 8GB Memory
 pub const SERIAL_PORT_ADDRESS: u64 = 0x10000000; // 가상 시리얼 포트 주소 (MMIO)
 
 pub struct Vm {

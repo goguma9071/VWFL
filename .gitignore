@@ -1,2 +1,11 @@
 puttygen.exe
 /target/
+/KrnlFile/ntoskrnl.exe
+/KrnlFile/BOOTVID.DLL
+/KrnlFile/hal.dll
+/KrnlFile/config/
+/KrnlFile/ci.dll
+/KrnlFile/kdcom.dll
+/KrnlFile/PSHED.dll
+/.idea/
+/old/
