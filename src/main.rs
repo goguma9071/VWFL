@@ -16,7 +16,7 @@ pub const KRNL_PBASE: u64  = 0x200000;
 pub const HAL_PBASE: u64   = 0x2000000;  
 pub const SYSTEM_BASE: u64 = 0x8000000;  
 pub const LPB_PBASE: u64   = 0x4000000;  
-pub const KPCR_PBASE: u64  = LPB_PBASE + 0xae80; 
+pub const KPCR_PBASE: u64  = LPB_PBASE + 0x10000; // [FIX] Page aligned (0x10000)
 pub const ACPI_PBASE: u64  = 0x5000000;
 pub const KUSER_PBASE: u64 = 0x9000000; 
 pub const STACK_PBASE: u64 = SYSTEM_BASE + 0x100000; 
@@ -24,7 +24,7 @@ pub const STACK_PBASE: u64 = SYSTEM_BASE + 0x100000;
 // --- Virtual Memory Layout (High-Half) ---
 const K_VIRT_ANY: u64  = 0xFFFFF80000000000;
 const LPB_VBASE: u64   = K_VIRT_ANY + LPB_PBASE; 
-const KPCR_VBASE: u64  = LPB_VBASE + 0xae80; 
+const KPCR_VBASE: u64  = LPB_VBASE + 0x10000; 
 const ACPI_VBASE: u64  = K_VIRT_ANY + ACPI_PBASE;
 const STACK_VBASE: u64 = K_VIRT_ANY + STACK_PBASE;
 
@@ -55,7 +55,7 @@ fn main() {
     LoaderParameterBlock::set_acpi(&mut vm, LPB_PBASE, rsdp_v).ok();
 
     let gdt_v: u64 = K_VIRT_ANY + SYSTEM_BASE;
-    let idt_v: u64 = K_VIRT_ANY; 
+    let idt_v: u64 = gdt_v + 0x20000; // [FIX] Move IDT to safe area (SYSTEM_BASE + 0x20000)
     let tss_v: u64 = gdt_v + 0x1000;
     LoaderParameterBlock::set_hardware_tables(&mut vm, LPB_PBASE, gdt_v, idt_v, tss_v).ok();
 
@@ -116,20 +116,25 @@ fn setup_kernel_paging(vm: &mut Vm, krnl_base: u64, _hal_base: u64) -> Result<()
     let pd_stack_p    = SYSTEM_BASE + 0xB000;
     let pd_user_p     = SYSTEM_BASE + 0xC000;
     let pd_ib_p       = SYSTEM_BASE + 0xD000;
+    let pd_hal_dll_p  = SYSTEM_BASE + 0x14000; // [NEW] PD for HAL.DLL
+    let bridge_p      = SYSTEM_BASE + 0x30000; // [NEW] Syscall Bridge Page
     
-    // [FIX] HAL/APIC Mapping Structures (High Virtual Address)
+    // [FIX] Additional page table definitions (Moved to safe area to avoid clash with IDT stubs)
     let pdpt_hal_p    = SYSTEM_BASE + 0xE000;
     let pd_hal_p      = SYSTEM_BASE + 0xF000;
+    let pd_mirror_4_p = SYSTEM_BASE + 0x40000;
+    let pd_mirror_5_p = SYSTEM_BASE + 0x41000;
+    let pd_mirror_6_p = SYSTEM_BASE + 0x42000;
+    let pd_mirror_7_p = SYSTEM_BASE + 0x43000;
 
-    // [FIX] Additional Identity Mapping PDs (4GB-8GB)
-    let pd_mirror_4_p = SYSTEM_BASE + 0x10000;
-    let pd_mirror_5_p = SYSTEM_BASE + 0x11000;
-    let pd_mirror_6_p = SYSTEM_BASE + 0x12000;
-    let pd_mirror_7_p = SYSTEM_BASE + 0x13000;
+    // [FIX] Clear entire paging structure area (512KB)
+    vm.write_memory(SYSTEM_BASE as usize, &[0u8; 524288])?; 
 
-    vm.write_memory(SYSTEM_BASE as usize, &[0u8; 65536])?; 
+    // [FIX] Prepare Syscall Bridge Code (VMCALL; RET)
+    // This allows us to intercept every SYSCALL from Windows apps.
+    vm.write_memory(bridge_p as usize, &[0x0F, 0x01, 0xC1, 0xC3])?; 
 
-    // 1. PML4 연결
+    // [FIX] HAL/APIC Mapping Structures (High Virtual Address)
     vm.write_memory(pml4_p as usize, &((pdpt_high_p | 0x3).to_le_bytes()))?; // Index 0 (Mirror)
     vm.write_memory((pml4_p + 496*8) as usize, &((pdpt_high_p | 0x3).to_le_bytes()))?; // Index 496 (Kernel)
     vm.write_memory((pml4_p + 509*8) as usize, &((pdpt_stack_p | 0x3).to_le_bytes()))?; // Index 509 (Stack)
@@ -173,13 +178,12 @@ fn setup_kernel_paging(vm: &mut Vm, krnl_base: u64, _hal_base: u64) -> Result<()
         }
     }
     
-    // [FIX] HAL APIC Mapping (0xFFFFFFFFFFE00000 -> 0xFEE00000)
-    // PWT(WriteThrough) + PCD(CacheDisable) + LargePage(2MB)
-    vm.write_memory((pd_hal_p + 511*8) as usize, &((0xFEE00000u64 | 0x93).to_le_bytes()))?;
-
-    // 4. PD: 커널 이미지 전용 매핑 (0x140000000 -> 0x200000)
+    // 4. [FIX] 커널 이미지 전용 매핑 (Identity Mapping 이후에 수행하여 덮어쓰기 방지)
+    // 0x140000000 -> 0x200000
+    let ib_pml4_idx = (krnl_base >> 39) & 0x1ff;
     let ib_pdpt_idx = (krnl_base >> 30) & 0x1ff;
     let target_pdpt = if ib_pml4_idx == 496 { pdpt_high_p } else if ib_pml4_idx == 0 { pdpt_high_p } else { pdpt_ib_p };
+    
     vm.write_memory((target_pdpt + ib_pdpt_idx*8) as usize, &((pd_ib_p | 0x3).to_le_bytes()))?;
 
     for j in 0..64 {
@@ -187,16 +191,40 @@ fn setup_kernel_paging(vm: &mut Vm, krnl_base: u64, _hal_base: u64) -> Result<()
         vm.write_memory((pd_ib_p + j as u64 * 8) as usize, &((phys | 0x83).to_le_bytes()))?;
     }
 
-    // 5. PD: Stack 전용 매핑
+    // 5. PD: HAL APIC Mapping (0xFFFFFFFFFFE00000 -> 0xFEE00000)
+    // PWT(WriteThrough) + PCD(CacheDisable) + LargePage(2MB)
+    vm.write_memory((pd_hal_p + 511*8) as usize, &((0xFEE00000u64 | 0x93).to_le_bytes()))?;
+
+    // 6. PD: Stack 전용 매핑
     for j in 0..512 {
         let phys = STACK_PBASE + (j as u64 * 0x200000);
         vm.write_memory((pd_stack_p + j as u64 * 8) as usize, &((phys | 0x83).to_le_bytes()))?;
     }
 
-    // 6. PD: KUSER 전용 매핑
+    // 7. PD: KUSER 전용 매핑
     for j in 0..512 {
         let phys = KUSER_PBASE + (j as u64 * 0x200000);
         vm.write_memory((pd_user_p + j as u64 * 8) as usize, &((phys | 0x83).to_le_bytes()))?;
+    }
+
+    // 8. [FIX] HAL.DLL Mapping (0x180000000 -> HAL_PBASE)
+    // 0x180000000 -> PML4 Index 0, PDPT Index 6 (6GB)
+    let hal_pml4_idx = (0x180000000u64 >> 39) & 0x1ff; 
+    let hal_pdpt_idx = (0x180000000u64 >> 30) & 0x1ff; 
+
+    let target_pdpt_for_hal = if hal_pml4_idx == 0 { pdpt_high_p } else { SYSTEM_BASE + 0x15000 };
+
+    if hal_pml4_idx != 0 {
+        vm.write_memory((pml4_p + hal_pml4_idx * 8) as usize, &((target_pdpt_for_hal | 0x3).to_le_bytes()))?;
+    }
+
+    // Connect PD_HAL_DLL to PDPT
+    vm.write_memory((target_pdpt_for_hal + hal_pdpt_idx * 8) as usize, &((pd_hal_dll_p | 0x3).to_le_bytes()))?;
+    
+    // Map HAL Physical Memory
+    for j in 0..32 {
+        let phys = HAL_PBASE + (j as u64 * 0x200000);
+        vm.write_memory((pd_hal_dll_p + j as u64 * 8) as usize, &((phys | 0x83).to_le_bytes()))?;
     }
 
     Ok(())

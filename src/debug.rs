@@ -64,9 +64,44 @@ pub fn handle_diagnostic_trap(vm: &mut Vm, vector: u8) -> Result<(), Box<dyn std
     // [SPECIAL] Skip Vector 3 (Breakpoint)
     if vector == 3 {
         let current_rip = read_phys_u64(rsp_phys);
-        // RIP를 1 증가시켜 INT 3 (0xCC) 다음 명령어로 이동
-        write_phys_u64(rsp_phys, current_rip + 1);
+        let old_rflags = read_phys_u64(rsp_phys + 16);
+        let old_rsp = read_phys_u64(rsp_phys + 24);
+        
+        println!("[DEBUG] Breakpoint (Vector 3) triggered at RIP: 0x{:016x}. Resuming...", current_rip);
+        
+        let mut regs = vm.vcpu_fd.get_regs()?;
+        regs.rip = current_rip + 1; // INT 3 is 1 byte (0xCC)
+        regs.rax = read_phys_u64(phys_base);
+        regs.rcx = read_phys_u64(phys_base + 8);
+        regs.rdx = read_phys_u64(phys_base + 16);
+        regs.rsp = old_rsp;
+        regs.rflags = old_rflags;
+        vm.vcpu_fd.set_regs(&regs)?;
         return Ok(());
+    }
+
+    // [SPECIAL] Handle INT 0x2d (Debug Service)
+    if vector == 0x2d {
+        let current_rip = read_phys_u64(rsp_phys);
+        let old_rflags = read_phys_u64(rsp_phys + 16);
+        let old_rsp = read_phys_u64(rsp_phys + 24);
+        
+        println!("[DEBUG] Debug Service (INT 0x2d) triggered at RIP: 0x{:016x}. Skipping...", current_rip);
+        
+        let mut regs = vm.vcpu_fd.get_regs()?;
+        regs.rip = current_rip + 2; // INT 0x2d is 2 bytes (0xCD 0x2D)
+        regs.rax = read_phys_u64(phys_base);
+        regs.rcx = read_phys_u64(phys_base + 8);
+        regs.rdx = read_phys_u64(phys_base + 16);
+        regs.rsp = old_rsp;
+        regs.rflags = old_rflags;
+        vm.vcpu_fd.set_regs(&regs)?;
+        return Ok(());
+    }
+
+    if vector == 13 {
+        println!("\n[FATAL] General Protection Fault (#GP) detected!");
+        // #GP는 무시하면 무한 루프에 빠질 가능성이 매우 높으므로 덤프 출력 후 종료 유도
     }
 
     println!("\n[DIAGNOSTIC] Trap triggered! Vector Number: {}", vector);
@@ -132,26 +167,29 @@ pub fn hex_dump(vm: &Vm, paddr: u64, size: usize) {
 }
 
 pub fn setup_diagnostic_idt(vm: &mut Vm) -> Result<(), Box<dyn std::error::Error>> {
-    let stub_base = crate::SYSTEM_BASE + 0x10000; 
+    let idt_pbase = crate::SYSTEM_BASE + 0x20000; // [FIX] IDT physical base
+    let stub_base_p = crate::SYSTEM_BASE + 0x10000; 
+    let stub_base_v = 0xFFFFF80000000000 + stub_base_p; 
     let save_area: u64 = 0x70000; 
 
     for i in 0..256 {
+        // ... (stub 생략은 동일)
         let mut stub = Vec::new();
         stub.extend_from_slice(&[0x48, 0xA3]); stub.extend_from_slice(&save_area.to_le_bytes()); 
         stub.extend_from_slice(&[0x48, 0x89, 0xC8, 0x48, 0xA3]); stub.extend_from_slice(&(save_area + 8).to_le_bytes()); 
         stub.extend_from_slice(&[0x48, 0x89, 0xD0, 0x48, 0xA3]); stub.extend_from_slice(&(save_area + 16).to_le_bytes()); 
         stub.extend_from_slice(&[0xB0, i as u8, 0xE6, 0xF9, 0xF4]); 
         
-        vm.write_memory((stub_base + i as u64 * 64) as usize, &stub).map_err(|e| e.to_string())?;
+        vm.write_memory((stub_base_p + i as u64 * 64) as usize, &stub).map_err(|e| e.to_string())?;
 
         let mut entry = [0u8; 16];
-        let h = stub_base + i as u64 * 64;
+        let h = stub_base_v + i as u64 * 64; 
         entry[0..2].copy_from_slice(&(h as u16).to_le_bytes()); 
         entry[2..4].copy_from_slice(&0x10u16.to_le_bytes());    
-        entry[5] = 0x8E;                                        
+        entry[5] = 0xEE; // [FIX] Present=1, DPL=3, Type=Interrupt Gate (0x0E) -> 0xEE
         entry[6..8].copy_from_slice(&((h >> 16) as u16).to_le_bytes()); 
         entry[8..12].copy_from_slice(&((h >> 32) as u32).to_le_bytes()); 
-        vm.write_memory((i as u64 * 16) as usize, &entry).map_err(|e| e.to_string())?;
+        vm.write_memory((idt_pbase + i as u64 * 16) as usize, &entry).map_err(|e| e.to_string())?;
     }
     Ok(())
 }

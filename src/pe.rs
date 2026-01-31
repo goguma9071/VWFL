@@ -19,13 +19,26 @@ pub struct PeFile {
     pub architecture: Architecture,
     pub image_base: u64,
     pub sections: Vec<Section>,
+    pub header_data: Vec<u8>, // 추가: PE 헤더 데이터
     pub pdb_name: String,
-    pub pdb_guid_age: String, // 추가: PDB를 다운로드하기 위한 식별자
+    pub pdb_guid_age: String, 
 }
 
 /// 외부에서 호출할 수 있는 파싱 함수
 pub fn parse(bytes: &[u8]) -> Result<PeFile, &'static str> {
-    PeFile::from_bytes(bytes)
+    let mut pe = PeFile::from_bytes(bytes)?;
+    
+    // 헤더 데이터 추출 (첫 섹션의 RawData 시작점 이전까지)
+    let header_size = if !pe.sections.is_empty() {
+        // 섹션들의 raw_data 시작점 중 최소값을 찾음 (보통 0x400 ~ 0x1000)
+        // 여기서는 간단히 4096바이트 또는 첫 섹션 이전까지로 제한
+        4096.min(bytes.len())
+    } else {
+        bytes.len().min(4096)
+    };
+    pe.header_data = bytes[..header_size].to_vec();
+    
+    Ok(pe)
 }
 
 impl PeFile {
@@ -66,6 +79,7 @@ impl PeFile {
             architecture,
             image_base,
             sections,
+            header_data: Vec::new(),
             pdb_name,
             pdb_guid_age,
         })

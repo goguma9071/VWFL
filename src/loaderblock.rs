@@ -6,11 +6,16 @@ pub struct Kpcr;
 impl Kpcr {
     pub fn setup(vm: &mut Vm, vaddr: u64, paddr: u64) -> Result<(), &'static str> {
         let prcb_v = vaddr + 0x180;
-        // KPCR/PRCB 영역을 32KB로 확장하여 안정성 확보
+        // KPCR/PRCB 영역 초기화 (32KB)
         vm.write_memory(paddr as usize, &[0u8; 32768])?;
-        vm.write_memory(paddr as usize + 0x18, &vaddr.to_le_bytes())?;
-        vm.write_memory(paddr as usize + 0x20, &prcb_v.to_le_bytes())?;
-        vm.write_memory(paddr as usize + 0x180, &prcb_v.to_le_bytes())?;
+        
+        // [x64 KPCR Layout]
+        vm.write_memory(paddr as usize + 0x18, &vaddr.to_le_bytes())?; // SelfPcr @ 0x18
+        vm.write_memory(paddr as usize + 0x20, &prcb_v.to_le_bytes())?; // Prcb @ 0x20
+        
+        // [x64 KPRCB Layout]
+        // 0x180 (PRCB Start) 에는 데이터를 직접 쓰지 않습니다. (Type/Size 영역)
+        // 대신 Prcb->SelfPrcb (0x180 + 0x? ) 등의 연결이 필요할 수 있으나 기본은 0입니다.
         Ok(())
     }
 }
@@ -48,6 +53,20 @@ impl LoaderParameterBlock {
         vm.write_memory(lpb_p as usize + 0xE0, &arc_name_v.to_le_bytes())?; // ArcHalDeviceName @ 0xE0
         vm.write_memory(lpb_p as usize + 0xE8, &nt_path_v.to_le_bytes())?;  // NtBootPathName @ 0xE8
         vm.write_memory(lpb_p as usize + 0xF0, &nt_path_v.to_le_bytes())?;  // NtHalPathName @ 0xF0
+
+        // [FIX] LoadOptions (Boot Args) @ 0xF8
+        // Enable Serial Debugging via COM1 (Must be UTF-16LE)
+        let options_v = lpb_v + 0xC000;
+        let options_str = "/DEBUG /DEBUGPORT=COM1 /BAUDRATE=115200";
+        let mut options_bytes = Vec::new();
+        for c in options_str.encode_utf16() { 
+            options_bytes.extend_from_slice(&c.to_le_bytes()); 
+        }
+        options_bytes.extend_from_slice(&[0, 0]); // Null Terminator (2 bytes)
+
+        vm.write_memory((lpb_p + 0xC000) as usize, &options_bytes)?;
+        vm.write_memory(lpb_p as usize + 0xF8, &options_v.to_le_bytes())?; // LoadOptions (Standard)
+        vm.write_memory(lpb_p as usize + 0x108, &options_v.to_le_bytes())?; // LoadOptions (Alt)
 
         // 6. [FIX] Extension 연결 - x64 표준 오프셋 0x110
         let ext_v = lpb_v + 0x8000;
