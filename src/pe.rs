@@ -129,3 +129,68 @@ impl fmt::Display for PeFile {
         Ok(())
     }
 }
+
+impl PeFile {
+    pub fn apply_relocation(
+        &self,
+        vm: &mut crate::vm::Vm,
+        p_base: u64,
+        v_new: u64,
+    ) -> Result<(), &'static str> {
+        let delta = v_new.wrapping_sub(self.image_base);
+        if delta != 0 {
+            println!("[DEBUG] Reloc Needed! v_new: 0x{:x}, image_base: 0x{:x}, delta: 0x{:x}", v_new, self.image_base, delta);
+        } else 
+        
+        if delta == 0 {
+            println!("[PE] Delta is 0. Skipping relocation for {}", self.pdb_name);
+            return Ok(()); }
+
+        let reloc_section = self.sections.iter()
+            .find(|s| s.name == ".reloc")
+            .ok_or("Relocation failed: No .reloc section")?;
+
+        let data = &reloc_section.raw_data;
+        let mut offset = 0;
+
+        while offset + 8 <= data.len() {
+            let page_rva = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap());
+            let block_size = u32::from_le_bytes(data[offset+4..offset+8].try_into().unwrap());
+
+            if block_size == 0 { break; }
+
+            let entry_count = (block_size - 8) / 2;
+            for i in 0..entry_count {
+                let entry_pos = offset + 8 + (i as usize * 2);
+                if entry_pos + 2 > data.len() { break; }
+
+                let entry = u16::from_le_bytes(data[entry_pos..entry_pos+2].try_into().unwrap());
+                let reloc_type = entry >> 12;
+                let reloc_offset = entry & 0x0FFF;
+
+                if reloc_type == 10 { // IMAGE_REL_BASED_DIR64
+                    let target_rva = page_rva as u64 + reloc_offset as u64;
+                    let target_paddr = p_base + target_rva;
+
+                    // [수정] vm.read_memory 대신 포인터 직접 참조 사용
+                    unsafe {
+                        if (target_paddr as usize + 8) <= crate::vm::MEM_SIZE {
+                            let ptr = vm.mem_ptr.add(target_paddr as usize) as *mut u64;
+                            
+                            // 1. 기존 주소 읽기
+                            let current_ptr = std::ptr::read_unaligned(ptr);
+                            
+                            // 2. Delta 적용
+                            let new_ptr = current_ptr.wrapping_add(delta);
+                            
+                            // 3. 다시 쓰기
+                            std::ptr::write_unaligned(ptr, new_ptr);
+                        }
+                    }
+                }
+            }
+            offset += block_size as usize;
+        }
+        Ok(())
+    }
+}

@@ -70,6 +70,13 @@ impl Vm {
         // 6. vCPU 생성 (ID: 0)
         let vcpu_fd = vm_fd.create_vcpu(0)?;
 
+        // [FIX] Enable Guest Debug to intercept INT 3 before Guest IDT
+        let debug_struct = kvm_bindings::kvm_guest_debug {
+            control: kvm_bindings::KVM_GUESTDBG_ENABLE | kvm_bindings::KVM_GUESTDBG_USE_SW_BP,
+            ..Default::default()
+        };
+        vcpu_fd.set_guest_debug(&debug_struct)?;
+
         Ok(Vm {
             kvm,
             vm_fd,
@@ -85,9 +92,20 @@ impl Vm {
             return Err("Memory write out of bounds");
         }
         unsafe {
-            // mem_ptr + offset 위치에 data 복사
             let dest = self.mem_ptr.add(offset);
             ptr::copy_nonoverlapping(data.as_ptr(), dest, data.len());
+        }
+        Ok(())
+    }
+
+    /// 가상 메모리에서 데이터 읽기
+    pub fn read_memory(&self, offset: usize, data: &mut [u8]) -> Result<(), &'static str> {
+        if offset + data.len() > self.mem_size {
+            return Err("Memory read out of bounds");
+        }
+        unsafe {
+            let src = self.mem_ptr.add(offset);
+            ptr::copy_nonoverlapping(src, data.as_mut_ptr(), data.len());
         }
         Ok(())
     }

@@ -1,5 +1,11 @@
 use crate::vm::Vm;
-use kvm_bindings::{kvm_regs, kvm_msr_entry, Msrs};
+use crate::SYSTEM_BASE;
+use crate::KRNL_PBASE;
+use crate::HAL_PBASE;
+use crate::STACK_PBASE;
+use crate::KUSER_PBASE;
+use crate::MEM_SIZE;
+use kvm_bindings::{kvm_msr_entry, Msrs};
 
 pub fn dump_all_registers(vm: &mut Vm) -> Result<(), Box<dyn std::error::Error>> {
     let regs = vm.vcpu_fd.get_regs()?;
@@ -23,126 +29,230 @@ pub fn dump_all_registers(vm: &mut Vm) -> Result<(), Box<dyn std::error::Error>>
     let mut msrs = Msrs::from_entries(&[
         kvm_msr_entry { index: 0xc0000101, ..Default::default() },
         kvm_msr_entry { index: 0xc0000102, ..Default::default() },
-        kvm_msr_entry { index: 0xc0000082, ..Default::default() }, // LSTAR
+        kvm_msr_entry { index: 0xc0000082, ..Default::default() }, 
     ]).unwrap();
     
-    let mut gs_base = 0u64;
-    let mut kgs_base = 0u64;
-    let mut lstar = 0u64;
     if let Ok(_) = vm.vcpu_fd.get_msrs(&mut msrs) {
         let entries = msrs.as_slice();
-        gs_base = entries[0].data;
-        kgs_base = entries[1].data;
-        lstar = entries[2].data;
+        println!("GS_BASE: 0x{:016x}  KGS_BASE: 0x{:016x}", entries[0].data, entries[1].data);
+        println!("LSTAR  : 0x{:016x}", entries[2].data);
     }
-
-    println!("GS_BASE: 0x{:016x}  KGS_BASE: 0x{:016x}", gs_base, kgs_base);
-    println!("LSTAR  : 0x{:016x}", lstar);
     println!("CS: 0x{:x}  SS: 0x{:x}  DS: 0x{:x}", sregs.cs.selector, sregs.ss.selector, sregs.ds.selector);
     println!("---------------------------------------------------");
+    print!("Hex Dump:");
+    print!("{:?}", hex_dump_bytes(vm, SYSTEM_BASE + 0x60000, 0x100));
+
+    Ok(())
+}
+
+pub fn handle_guest_debug(vm: &mut Vm) -> Result<(), Box<dyn std::error::Error>> {
+    let mut regs = vm.vcpu_fd.get_regs()?;
+    let start_rip = regs.rip;
+
+    //1. traslate virtual to physical
+    let phys_rip = match virt_to_phys(start_rip) {
+        Some(p) => p,
+        None => {
+            println!("[DEBUG] RIP 0x{:016x} not mapped! (Failed to translate)", start_rip);
+            return Ok(());
+        }
+    };
+    
+    
+
+    let opcode = match safe_read_bytes(vm, phys_rip, 2) {
+        Ok(bytes) => bytes,
+        Err(_) => return Ok(()), // 메모리 범위 초과 시 무시
+    };
+
+    println!("[DEBUG] GuestDebug at 0x{:016x} | Instruction: 0x{:02x}", start_rip, opcode[0]);
+    // 3. 명령어 스킵 로직
+    let mut final_rip = start_rip;
+
+    if opcode[0] == 0xCC {
+        // INT 3 (1 byte)
+        final_rip += 1;
+    } else if opcode[0] == 0xCD && opcode[1] == 0x03 {
+        // INT 3 (2 bytes)
+        final_rip += 2;
+    } else if opcode[0] == 0xCD && opcode[1] == 0x2D {
+        // INT 2D (Windows Kernel Debug)
+        final_rip += 2;
+    }
+
+    // [GREEDY SKIP] Continue skipping CC padding
+     // 4. 연속된 INT 3 (CC) 스킵 (Greedy Skip) - 패딩 건너뛰기
+    // 주의: 루프 돌 때마다 물리 주소 재계산 필요 (페이지 경계 넘을 수 있음)
+    loop {
+        let current_phys = match virt_to_phys(final_rip) {
+            Some(p) => p,
+            None => break,
+        };
+        
+        match safe_read_bytes(vm, current_phys, 1) {
+            Ok(b) if b[0] == 0xCC => final_rip += 1,
+            _ => break,
+        }
+    }
+
+    // 5. RIP 업데이트 및 검증
+    if final_rip != start_rip {
+        println!("[DEBUG] Advanced RIP: 0x{:016x} -> 0x{:016x}", start_rip, final_rip);
+        regs.rip = final_rip;
+        vm.vcpu_fd.set_regs(&regs)?;
+        
+        // Double Check
+        let verify = vm.vcpu_fd.get_regs()?;
+        if verify.rip != final_rip {
+            eprintln!("[ERROR] Failed to update RIP!");
+        }
+    }
+
     Ok(())
 }
 
 pub fn handle_diagnostic_trap(vm: &mut Vm, vector: u8) -> Result<(), Box<dyn std::error::Error>> {
-    let phys_base = 0x70000;
-    let read_phys_u64 = |paddr: u64| -> u64 {
-        unsafe {
-            let ptr = vm.mem_ptr.add(paddr as usize);
-            u64::from_le_bytes(*(ptr as *const [u8; 8]))
-        }
-    };
-    let write_phys_u64 = |paddr: u64, val: u64| {
-        unsafe {
-            let ptr = vm.mem_ptr.add(paddr as usize);
-            *(ptr as *mut u64) = val;
-        }
-    };
+    // IDT 스텁이 레지스터를 저장한 영역 (SYSTEM_BASE + 0x60000)
+    // virt_to_phys를 거치지 않고 물리 주소를 직접 사용 (Identity Map 가정)
+    let save_area_phys = SYSTEM_BASE + 0x60000; 
 
-    let regs = vm.vcpu_fd.get_regs()?;
-    let rsp_phys = virt_to_phys(regs.rsp);
-
-    // [SPECIAL] Skip Vector 3 (Breakpoint)
-    if vector == 3 {
-        let current_rip = read_phys_u64(rsp_phys);
-        let old_rflags = read_phys_u64(rsp_phys + 16);
-        let old_rsp = read_phys_u64(rsp_phys + 24);
-        
-        println!("[DEBUG] Breakpoint (Vector 3) triggered at RIP: 0x{:016x}. Resuming...", current_rip);
-        
-        let mut regs = vm.vcpu_fd.get_regs()?;
-        regs.rip = current_rip + 1; // INT 3 is 1 byte (0xCC)
-        regs.rax = read_phys_u64(phys_base);
-        regs.rcx = read_phys_u64(phys_base + 8);
-        regs.rdx = read_phys_u64(phys_base + 16);
-        regs.rsp = old_rsp;
-        regs.rflags = old_rflags;
-        vm.vcpu_fd.set_regs(&regs)?;
-        return Ok(());
-    }
-
-    // [SPECIAL] Handle INT 0x2d (Debug Service)
-    if vector == 0x2d {
-        let current_rip = read_phys_u64(rsp_phys);
-        let old_rflags = read_phys_u64(rsp_phys + 16);
-        let old_rsp = read_phys_u64(rsp_phys + 24);
-        
-        println!("[DEBUG] Debug Service (INT 0x2d) triggered at RIP: 0x{:016x}. Skipping...", current_rip);
-        
-        let mut regs = vm.vcpu_fd.get_regs()?;
-        regs.rip = current_rip + 2; // INT 0x2d is 2 bytes (0xCD 0x2D)
-        regs.rax = read_phys_u64(phys_base);
-        regs.rcx = read_phys_u64(phys_base + 8);
-        regs.rdx = read_phys_u64(phys_base + 16);
-        regs.rsp = old_rsp;
-        regs.rflags = old_rflags;
-        vm.vcpu_fd.set_regs(&regs)?;
-        return Ok(());
-    }
-
-    if vector == 13 {
-        println!("\n[FATAL] General Protection Fault (#GP) detected!");
-        // #GP는 무시하면 무한 루프에 빠질 가능성이 매우 높으므로 덤프 출력 후 종료 유도
-    }
-
-    println!("\n[DIAGNOSTIC] Trap triggered! Vector Number: {}", vector);
+    let mut regs = vm.vcpu_fd.get_regs()?;
     
-    println!("------------------ EXCEPTION FRAME ------------------");
-
-    let has_error_code = matches!(vector, 8 | 10 | 11 | 12 | 13 | 14 | 17);
-    let faulting_rip = if has_error_code {
-        let err = read_phys_u64(rsp_phys);
-        let rip = read_phys_u64(rsp_phys + 8);
-        println!("ERROR CODE  : 0x{:x}", err);
-        println!("FAULTING RIP: 0x{:016x}", rip);
-        rip
-    } else {
-        let rip = read_phys_u64(rsp_phys);
-        println!("FAULTING RIP: 0x{:016x}", rip);
-        rip
+    // 1. 스택에서 예외 프레임(Trap Frame) 읽기
+    // Stack Layout: [RIP, CS, RFLAGS, RSP, SS]
+    let rsp_phys = match virt_to_phys(regs.rsp) {
+        Some(p) => p,
+        None => {
+            eprintln!("\n[PANIC] Stack corrupted! RSP: 0x{:016x}", regs.rsp);
+            return dump_all_registers(vm);
+        }
     };
 
-    let rip_phys = virt_to_phys(faulting_rip);
-    println!("CODE AT RIP (Phys: 0x{:x}): ", rip_phys);
-    hex_dump_bytes(vm, rip_phys, 16);
+    let pushed_rip  = safe_read_u64(vm, rsp_phys).unwrap_or(0);
+    // let pushed_cs   = safe_read_u64(vm, rsp_phys + 8).unwrap_or(0);
+    let old_rflags  = safe_read_u64(vm, rsp_phys + 16).unwrap_or(0);
+    let old_rsp     = safe_read_u64(vm, rsp_phys + 24).unwrap_or(0);
 
-    println!("STACK DUMP (Phys: 0x{:x}): ", rsp_phys);
-    hex_dump_bytes(vm, rsp_phys, 64);
+    // 2. IDT 스텁이 백업한 레지스터 복구
+    let orig_rax = safe_read_u64(vm, save_area_phys).unwrap_or(0);
+    let orig_rcx = safe_read_u64(vm, save_area_phys + 8).unwrap_or(0);
+    let orig_rdx = safe_read_u64(vm, save_area_phys + 16).unwrap_or(0);
 
-    println!("KERNEL RAX: 0x{:016x}", read_phys_u64(phys_base));
-    println!("KERNEL RCX: 0x{:016x}", read_phys_u64(phys_base + 8));
-    println!("KERNEL RDX: 0x{:016x}", read_phys_u64(phys_base + 16));
+    // 3. 디버그 예외 처리 (INT 3 or INT 2D via IDT)
+    if vector == 3 || vector == 0x2d {
+        let mut final_rip = pushed_rip;
+
+        if vector == 0x2d {
+            // Windows Debug Service: RAX=0 indicates success to the guest
+            regs.rax = 0; 
+            regs.rcx = orig_rcx;
+            regs.rdx = orig_rdx;
+        } else {
+            // Breakpoint: Restore original state
+            regs.rax = orig_rax;
+            regs.rcx = orig_rcx;
+            regs.rdx = orig_rdx;
+        }
+
+        // Skip current instruction (padding CC)
+        loop {
+            let p = match virt_to_phys(final_rip) {
+                Some(p) => p,
+                None => break,
+            };
+            match safe_read_bytes(vm, p, 1) {
+                Ok(b) if b[0] == 0xCC => final_rip += 1,
+                _ => break,
+            }
+        }
+
+        // Resume Guest
+        regs.rip = final_rip;
+        regs.rsp = old_rsp;
+        regs.rflags = old_rflags & !0x100; // Clear Trap Flag
+        vm.vcpu_fd.set_regs(&regs)?;
+        
+        return Ok(());
+    }
+
+    // 4. 그 외 예외는 크래시로 간주하고 덤프
+    println!("\n[DIAGNOSTIC] Trap triggered! Vector Number: {}", vector);
+    println!("------------------ EXCEPTION FRAME ------------------");
+    println!("FAULTING RIP: 0x{:016x}", pushed_rip);
+    println!("STACK DUMP   : 0x{:016x} (Phys: 0x{:x})", regs.rsp, rsp_phys);
+    println!("KERNEL RAX   : 0x{:016x}", orig_rax);
+    println!("KERNEL RCX   : 0x{:016x}", orig_rcx);
+    println!("KERNEL RDX   : 0x{:016x}", orig_rdx);
     
     dump_all_registers(vm)
 }
 
-fn virt_to_phys(vaddr: u64) -> u64 {
-    if vaddr >= 0xFFFFF80000000000 {
-        vaddr - 0xFFFFF80000000000
-    } else if vaddr >= 0x140000000 && vaddr < 0x180000000 {
-        (vaddr - 0x140000000) + 0x200000
-    } else {
-        vaddr & (crate::vm::MEM_SIZE as u64 - 1)
+// 안전한 물리 메모리 읽기 (경계 체크 추가)
+
+
+fn virt_to_phys(vaddr: u64) -> Option<u64> {
+    // 1. Kernel Identity Mapping Area (System Base 주변)
+    // 0xFFFFF80008000000 ~ (SYSTEM_BASE가 0x8000000일 경우)
+    let sys_virt_base = 0xFFFFF80000000000 + SYSTEM_BASE;
+    if vaddr >= sys_virt_base && vaddr < sys_virt_base + 0x2000000 { // 32MB 범위
+        return Some((vaddr - sys_virt_base) + SYSTEM_BASE);
     }
+
+    // 2. Kernel Image Area (ntoskrnl.exe)
+    // 매핑: 0xFFFFF80000400000 -> KRNL_PBASE
+    if vaddr >= 0xFFFFF80000400000 && vaddr < 0xFFFFF80000400000 + 0x2000000 { // 32MB
+        return Some((vaddr - 0xFFFFF80000400000) + KRNL_PBASE);
+    }
+
+    // 3. HAL Image Area (hal.dll)
+    // 매핑: 0xFFFFF80040000000 -> HAL_PBASE
+    if vaddr >= 0xFFFFF80040000000 && vaddr < 0xFFFFF80040000000 + 0x1000000 { // 16MB
+        return Some((vaddr - 0xFFFFF80040000000) + HAL_PBASE);
+    }
+
+    // 4. Kernel Stack Area
+    // 매핑: 0xFFFFFA8000000000 -> STACK_PBASE
+    if vaddr >= 0xFFFFFA8000000000 && vaddr < 0xFFFFFA8000000000 + 0x2000000 { // 32MB
+        return Some((vaddr - 0xFFFFFA8000000000) + STACK_PBASE);
+    }
+
+    // 5. KUSER_SHARED_DATA Area
+    // 매핑: 0xFFFFF78000000000 -> KUSER_PBASE
+    if vaddr >= 0xFFFFF78000000000 && vaddr < 0xFFFFF78000000000 + 0x200000 {
+        return Some((vaddr - 0xFFFFF78000000000) + KUSER_PBASE);
+    }
+
+    // 6. Identity Map (Boot phase / Low memory)
+    // 0 ~ MEM_SIZE
+    if vaddr < MEM_SIZE as u64 {
+        return Some(vaddr);
+    }
+
+    None // 매핑되지 않은 주소
+}
+
+/// 안전하게 물리 메모리에서 u64 값을 읽습니다.
+fn safe_read_u64(vm: &Vm, paddr: u64) -> Result<u64, ()> {
+    if paddr + 8 > MEM_SIZE as u64 {
+        return Err(());
+    }
+    unsafe {
+        let ptr = vm.mem_ptr.add(paddr as usize);
+        Ok(u64::from_le_bytes(*(ptr as *const [u8; 8])))
+    }
+}
+
+/// 안전하게 물리 메모리에서 바이트 배열을 읽습니다.
+fn safe_read_bytes(vm: &Vm, paddr: u64, size: usize) -> Result<Vec<u8>, ()> {
+    if paddr + size as u64 > MEM_SIZE as u64 {
+        return Err(());
+    }
+    let mut buf = vec![0u8; size];
+    unsafe {
+        let src = vm.mem_ptr.add(paddr as usize);
+        std::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), size);
+    }
+    Ok(buf)
 }
 
 fn hex_dump_bytes(vm: &Vm, paddr: u64, size: usize) {
@@ -160,20 +270,13 @@ fn hex_dump_bytes(vm: &Vm, paddr: u64, size: usize) {
     }
 }
 
-pub fn hex_dump(vm: &Vm, paddr: u64, size: usize) {
-    println!("--- HEX DUMP (Phys: 0x{:x}, Size: {}) ---", paddr, size);
-    hex_dump_bytes(vm, paddr, size);
-    println!("-----------------------------------------");
-}
-
 pub fn setup_diagnostic_idt(vm: &mut Vm) -> Result<(), Box<dyn std::error::Error>> {
-    let idt_pbase = crate::SYSTEM_BASE + 0x20000; // [FIX] IDT physical base
+    let idt_pbase = crate::SYSTEM_BASE + 0x20000; 
     let stub_base_p = crate::SYSTEM_BASE + 0x10000; 
     let stub_base_v = 0xFFFFF80000000000 + stub_base_p; 
-    let save_area: u64 = 0x70000; 
+    let save_area: u64 = crate::SYSTEM_BASE + 0x60000; 
 
     for i in 0..256 {
-        // ... (stub 생략은 동일)
         let mut stub = Vec::new();
         stub.extend_from_slice(&[0x48, 0xA3]); stub.extend_from_slice(&save_area.to_le_bytes()); 
         stub.extend_from_slice(&[0x48, 0x89, 0xC8, 0x48, 0xA3]); stub.extend_from_slice(&(save_area + 8).to_le_bytes()); 
@@ -186,7 +289,7 @@ pub fn setup_diagnostic_idt(vm: &mut Vm) -> Result<(), Box<dyn std::error::Error
         let h = stub_base_v + i as u64 * 64; 
         entry[0..2].copy_from_slice(&(h as u16).to_le_bytes()); 
         entry[2..4].copy_from_slice(&0x10u16.to_le_bytes());    
-        entry[5] = 0xEE; // [FIX] Present=1, DPL=3, Type=Interrupt Gate (0x0E) -> 0xEE
+        entry[5] = 0xEE; 
         entry[6..8].copy_from_slice(&((h >> 16) as u16).to_le_bytes()); 
         entry[8..12].copy_from_slice(&((h >> 32) as u32).to_le_bytes()); 
         vm.write_memory((idt_pbase + i as u64 * 16) as usize, &entry).map_err(|e| e.to_string())?;
