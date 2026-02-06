@@ -39,8 +39,9 @@ pub fn dump_all_registers(vm: &mut Vm) -> Result<(), Box<dyn std::error::Error>>
     }
     println!("CS: 0x{:x}  SS: 0x{:x}  DS: 0x{:x}", sregs.cs.selector, sregs.ss.selector, sregs.ds.selector);
     println!("---------------------------------------------------");
-    print!("Hex Dump:");
-    print!("{:?}", hex_dump_bytes(vm, SYSTEM_BASE + 0x60000, 0x100));
+    println!("Hex Dump at 0x{:x}:", SYSTEM_BASE + 0x60000);
+    hex_dump_bytes(vm, SYSTEM_BASE + 0x60000, 0x100);
+    println!("END------------");
 
     Ok(())
 }
@@ -199,21 +200,27 @@ fn virt_to_phys(vaddr: u64) -> Option<u64> {
     }
 
     // 2. Kernel Image Area (ntoskrnl.exe)
-    // 매핑: 0xFFFFF80000400000 -> KRNL_PBASE
-    if vaddr >= 0xFFFFF80000400000 && vaddr < 0xFFFFF80000400000 + 0x2000000 { // 32MB
-        return Some((vaddr - 0xFFFFF80000400000) + KRNL_PBASE);
+    if vaddr >= 0xFFFFF80000200000 && vaddr < 0xFFFFF80000200000 + 0x2000000 { // 32MB
+        return Some((vaddr - 0xFFFFF80000200000) + KRNL_PBASE);
     }
 
     // 3. HAL Image Area (hal.dll)
-    // 매핑: 0xFFFFF80040000000 -> HAL_PBASE
-    if vaddr >= 0xFFFFF80040000000 && vaddr < 0xFFFFF80040000000 + 0x1000000 { // 16MB
-        return Some((vaddr - 0xFFFFF80040000000) + HAL_PBASE);
+
+    if vaddr >= 0x1c0000000 && vaddr < 0x1c0000000 + 0x1000000 { // 16MB
+        return Some((vaddr - 0x1c0000000) + HAL_PBASE);
     }
 
     // 4. Kernel Stack Area
     // 매핑: 0xFFFFFA8000000000 -> STACK_PBASE
+    /*
     if vaddr >= 0xFFFFFA8000000000 && vaddr < 0xFFFFFA8000000000 + 0x2000000 { // 32MB
         return Some((vaddr - 0xFFFFFA8000000000) + STACK_PBASE);
+    }
+    */
+
+    // 4. Kernel Stack Area (Index 509)
+    if vaddr >= 0xFFFFFE8000000000 && vaddr < 0xFFFFFE8000000000 + 0x2000000 {
+        return Some((vaddr - 0xFFFFFE8000000000) + STACK_PBASE);
     }
 
     // 5. KUSER_SHARED_DATA Area
@@ -274,13 +281,22 @@ pub fn setup_diagnostic_idt(vm: &mut Vm) -> Result<(), Box<dyn std::error::Error
     let idt_pbase = crate::SYSTEM_BASE + 0x20000; 
     let stub_base_p = crate::SYSTEM_BASE + 0x10000; 
     let stub_base_v = 0xFFFFF80000000000 + stub_base_p; 
-    let save_area: u64 = crate::SYSTEM_BASE + 0x60000; 
+    let save_area: u64 = crate::SYSTEM_BASE + 0x60000;
+    let save_area_v: u64 = 0xFFFFF80000000000 + save_area; 
 
     for i in 0..256 {
         let mut stub = Vec::new();
-        stub.extend_from_slice(&[0x48, 0xA3]); stub.extend_from_slice(&save_area.to_le_bytes()); 
-        stub.extend_from_slice(&[0x48, 0x89, 0xC8, 0x48, 0xA3]); stub.extend_from_slice(&(save_area + 8).to_le_bytes()); 
-        stub.extend_from_slice(&[0x48, 0x89, 0xD0, 0x48, 0xA3]); stub.extend_from_slice(&(save_area + 16).to_le_bytes()); 
+        
+        // [수정 완료] save_area -> save_area_v 로 변경
+        stub.extend_from_slice(&[0x48, 0xA3]); 
+        stub.extend_from_slice(&save_area_v.to_le_bytes()); 
+        
+        stub.extend_from_slice(&[0x48, 0x89, 0xC8, 0x48, 0xA3]); 
+        stub.extend_from_slice(&(save_area_v + 8).to_le_bytes()); 
+        
+        stub.extend_from_slice(&[0x48, 0x89, 0xD0, 0x48, 0xA3]); 
+        stub.extend_from_slice(&(save_area_v + 16).to_le_bytes()); 
+        
         stub.extend_from_slice(&[0xB0, i as u8, 0xE6, 0xF9, 0xF4]); 
         
         vm.write_memory((stub_base_p + i as u64 * 64) as usize, &stub).map_err(|e| e.to_string())?;
@@ -289,7 +305,7 @@ pub fn setup_diagnostic_idt(vm: &mut Vm) -> Result<(), Box<dyn std::error::Error
         let h = stub_base_v + i as u64 * 64; 
         entry[0..2].copy_from_slice(&(h as u16).to_le_bytes()); 
         entry[2..4].copy_from_slice(&0x10u16.to_le_bytes());    
-        entry[5] = 0xEE; 
+        entry[5] = 0x8E; // [추가 권장] 0xEE는 유저모드 호출 허용. 0x8E(커널 전용)가 더 안전합니다.
         entry[6..8].copy_from_slice(&((h >> 16) as u16).to_le_bytes()); 
         entry[8..12].copy_from_slice(&((h >> 32) as u32).to_le_bytes()); 
         vm.write_memory((idt_pbase + i as u64 * 16) as usize, &entry).map_err(|e| e.to_string())?;

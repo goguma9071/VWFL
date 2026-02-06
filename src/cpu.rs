@@ -14,27 +14,20 @@ pub fn run(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> Result<(
 
     let mut loop_count: u64 = 0;
     let mut serial_detected = false;
+    println!("[DEBUG] Entering KVM run loop");
 
     loop {
         loop_count += 1;
+        println!("loop count: {}", loop_count);
 
         // KVM 싱글 스텝 활성화 (디버깅용)
-    let mut guest_debug = kvm_bindings::kvm_guest_debug {
-        control: 0x00000001 | 0x00000002, // ENABLE | SINGLESTEP
-        ..Default::default()
-    };
-    vm.vcpu_fd.set_guest_debug(&guest_debug).ok();
+        let guest_debug = kvm_bindings::kvm_guest_debug {
+            control: 0x00000001 | 0x00000002, // ENABLE | SINGLESTEP
+            ..Default::default() 
+        };
+        vm.vcpu_fd.set_guest_debug(&guest_debug).ok();
 
-    
-    println!("Step RIP: 0x{:016x}", vm.vcpu_fd.get_regs()?.rip);
-    let exit = vm.vcpu_fd.run()?;
-    
-    if let VcpuExit::Debug(_) = exit {
-        // 한 줄씩 실행되는 것을 확인
-    }
-        
-        // [FIX] RBP Sanitization: Only call set_regs if a change is actually needed.
-        // This prevents overwriting the RIP updated by handle_guest_debug.
+        // 1. 사전 상태 보정 및 로그
         let mut regs = vm.vcpu_fd.get_regs()?;
         {
             let rbp_prefix = regs.rbp >> 47;
@@ -44,9 +37,13 @@ pub fn run(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> Result<(
                 vm.vcpu_fd.set_regs(&regs).ok();
             }
         }
+        println!("[DEBUG] KVM Run Iteration: {} | Current RIP: 0x{:016x}", loop_count, regs.rip);
 
+        // 2. 단일 실행 (The Only Run)
         let exit_reason = vm.vcpu_fd.run()?;
+        
         println!("Exit Reason: {:?}, RIP: 0x{:x}", exit_reason, regs.rip);
+        println!("[DEBUG] Iteration {} Exit: {:?}", loop_count, exit_reason);
 
 
 
@@ -307,16 +304,16 @@ fn setup_long_mode(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> 
     let regs_after = vm.vcpu_fd.get_regs()?;
 
     println!("\n[DEBUG] AFTER SET_SREGS & SET_REGS CHECK - MUST SEE THIS LOG!");
-    println!("CR0:  0x{:016x}  (bit31 PG=1, bit0 PE=1 이어야 함)", sregs_after.cr0);
+    println!("CR0:  0x{:016x} ", sregs_after.cr0);
     println!("CR4:  0x{:016x}  (bit5 PAE=1)", sregs_after.cr4);
     println!("EFER: 0x{:016x}  (bit8 LME=1, bit11 NXE=1)", sregs_after.efer);
-    println!("CR3:  0x{:016x}  (PML4 phys addr 0x8002000 이어야 함)", sregs_after.cr3);
-    println!("GDT base: 0x{:016x}  (0xFFFFF80008000000 형태의 virtual addr)", sregs_after.gdt.base);
+    println!("CR3:  0x{:016x}  (PML4 phys addr 0x8002000)", sregs_after.cr3);
+    println!("GDT base: 0x{:016x}  ", sregs_after.gdt.base);
     println!("IDT base: 0x{:016x}", sregs_after.idt.base);
     println!("CS: selector=0x{:x}, l=1 (long mode code segment)", sregs_after.cs.selector);
     println!("GS.base: 0x{:016x}  (KPCR virtual addr)", sregs_after.gs.base);
     println!("RIP: 0x{:016x}  (kernel entry point)", regs_after.rip);
-    println!("RCX: 0x{:016x}  (LPB virtual addr 이어야 함)", regs_after.rcx);
+    println!("RCX: 0x{:016x} ", regs_after.rcx);
     println!("RSP: 0x{:016x}", regs_after.rsp);
 
     Ok(())
