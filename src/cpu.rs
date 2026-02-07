@@ -22,7 +22,7 @@ pub fn run(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> Result<(
 
         // KVM 싱글 스텝 활성화 (디버깅용)
         let guest_debug = kvm_bindings::kvm_guest_debug {
-            control: 0x00000001 | 0x00000002, // ENABLE | SINGLESTEP
+            control: 0x00000001,  //| 0x00000002, // ENABLE | SINGLESTEP
             ..Default::default() 
         };
         vm.vcpu_fd.set_guest_debug(&guest_debug).ok();
@@ -245,7 +245,7 @@ fn setup_long_mode(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> 
 
     vm.vcpu_fd.set_fpu(&kvm_bindings::kvm_fpu::default())?;
     let mut sregs = vm.vcpu_fd.get_sregs()?;
-    sregs.cr3 = gdt_pbase + 0x2000;
+    sregs.cr3 = gdt_pbase + 0x100000 + 0x2000;
     sregs.cr4 = (1 << 5) | (1 << 9) | (1 << 10) | (1 << 16); 
     sregs.efer = (1 << 0) | (1 << 8) | (1 << 10) | (1 << 11); 
     sregs.cr0 = (1 << 31) | (1 << 0) | (1 << 1) | (1 << 16) | (1 << 21); // bit21 WP=1 (Write Protect), bit16 NE=1 (Numeric Error), bit1 MP=1 (Monitor Coprocessor)

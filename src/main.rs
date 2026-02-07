@@ -82,10 +82,12 @@ fn main() {
         // Hive Mapping (16MB)
         let hive_pdpt_idx = (hive_v >> 30) & 0x1ff; // Index 1
         let hive_pd_idx = (hive_v >> 21) & 0x1ff;   // Index 168 (0xA8)
+        let hive_paging_pbase = SYSTEM_BASE + 0x100000;
+
         
         // PDPT[1] is already mapped to pd_hal_dll_p (0x14000)
         // We need to add PDE entries for Hive in pd_hal_dll_p
-        let pd_hal_p = SYSTEM_BASE + 0x14000;
+        let pd_hal_p = SYSTEM_BASE + 0x100000 + 0x14000;
         
         for j in 0..((hive_size as u64 + 0x1FFFFF) / 0x200000) {
             let phys = hive_p + (j * 0x200000) as usize;
@@ -96,8 +98,8 @@ fn main() {
         let stack_v: u64 = STACK_VBASE + 0x10000; 
     
         // [STRICT] LPB Initialization with canonical addresses
-        LoaderParameterBlock::setup(&mut vm, LPB_VBASE, LPB_PBASE, KPCR_VBASE + 0x180, stack_v, hive_v, hive_size).expect("LPB Init");
-        Kpcr::setup(&mut vm, KPCR_VBASE, KPCR_PBASE).expect("KPCR Init");
+    LoaderParameterBlock::setup(&mut vm, LPB_VBASE, LPB_PBASE, KPCR_VBASE + 0x180, stack_v, hive_v, hive_size).expect("LPB Init");
+    Kpcr::setup(&mut vm, KPCR_VBASE, KPCR_PBASE).expect("KPCR Init");
     let rsdp_v = acpi::setup(&mut vm, ACPI_PBASE, ACPI_VBASE).expect("ACPI failed");
     LoaderParameterBlock::set_acpi(&mut vm, LPB_PBASE, rsdp_v).ok();
 
@@ -112,16 +114,18 @@ fn main() {
         module_data.push((v, p, entry, size, name.to_string()));
     };
 
-    load_and_push("ntoskrnl.exe", KRNL_PBASE, krnl_vbase);
-    load_and_push("hal.dll", HAL_PBASE, hal_vbase);
     load_and_push("kd.dll", KD_PBASE, KD_VBASE);
     load_and_push("PSHED.DLL", PSHED_PBASE, PSHED_VBASE);
     load_and_push("BOOTVID.DLL", BOOTVID_PBASE, BOOTVID_VBASE);
     load_and_push("ci.dll", CI_PBASE, CI_VBASE);
 
+    // [FIX] ntoskrnl and hal metadata must be in module_data for linking, but already loaded
+    module_data.insert(0, (krnl_vbase, KRNL_PBASE, krnl_entry_v, krnl_size, "ntoskrnl.exe".to_string()));
+    module_data.insert(1, (hal_vbase, HAL_PBASE, hal_entry_v, hal_size, "hal.dll".to_string()));
+
     let mut nodes = Vec::new();
     for (i, m) in module_data.iter().enumerate() {
-        let offset = 0x5000 + (i as u64 * 0x100); // 256바이트 간격
+        let offset = 0x5000 + (i as u64 * 0x1000); // 256바이트 간격
         let node_v = LPB_VBASE + offset;
         let node_p = LPB_PBASE + offset;
         LoaderParameterBlock::add_module(&mut vm, LPB_VBASE, LPB_PBASE, node_v, node_p, m.0, m.2, m.3, &m.4).ok();
@@ -129,9 +133,9 @@ fn main() {
     }
 
     // 순환 리스트 연결 (0x00, 0x10, 0x20 오프셋 모두)
-    let head_v = LPB_VBASE + 0x10;
-    vm.write_memory(LPB_PBASE as usize + 0x10, &nodes[0].0.to_le_bytes()).ok(); // Head -> m1
-    vm.write_memory(LPB_PBASE as usize + 0x18, &nodes.last().unwrap().0.to_le_bytes()).ok(); // Head <- m6
+    let head_v = LPB_VBASE + 0x00;
+    vm.write_memory(LPB_PBASE as usize + 0x00, &nodes[0].0.to_le_bytes()).ok(); // Head -> m1
+    vm.write_memory(LPB_PBASE as usize + 0x08, &nodes.last().unwrap().0.to_le_bytes()).ok(); // Head <- m6
 
     for i in 0..nodes.len() {
         let next_v = if i == nodes.len() - 1 { head_v } else { nodes[i+1].0 };
@@ -145,6 +149,36 @@ fn main() {
     let gdt_v: u64 = K_VIRT_ANY + SYSTEM_BASE;
     let idt_v: u64 = gdt_v + 0x20000; 
     let tss_v: u64 = gdt_v + 0x1000;
+    let tss_p = SYSTEM_BASE + 0x1000;
+
+
+    vm.write_memory(tss_p as usize, &[0u8; 104]).expect("Write TSS");
+
+    let mut gdt_entries = vec![0u64; 32];
+    gdt_entries[0] = 0x0000000000000000;
+    gdt_entries[1] = 0x0000000000000000;
+    gdt_entries[2] = 0x00AF9A000000FFFF;
+    gdt_entries[3] = 0x00CF92000000FFFF;
+    gdt_entries[4] = 0x00AFFA000000FFFF;
+    gdt_entries[5] = 0x00CFF2000000FFFF;
+    gdt_entries[6] = 0x00AFFA000000FFFF;
+
+    let tss_limit = 0x67;
+    let base_low = tss_p & 0xFFFFFF;
+    let base_mid = (tss_p >> 24) & 0xFF;
+    let limit_low = tss_limit & 0xFFFF;
+    let access = 0x89;
+    let flags = 0x00;
+    let tss_low = (base_mid << 56) | ((flags as u64) << 52) | ((access as u64)<< 40) | (base_low << 16) |(limit_low);
+    let tss_high = tss_p >> 32;
+
+    gdt_entries[8] = tss_low;
+    gdt_entries[9] = tss_high;
+
+    for (i, entry) in gdt_entries.iter().enumerate() {
+        vm.write_memory((SYSTEM_BASE + i as u64 * 8) as usize, &entry.to_le_bytes()).expect("Write GDT");
+    }
+
     LoaderParameterBlock::set_hardware_tables(&mut vm, LPB_PBASE, gdt_v, idt_v, tss_v).ok();
 
     // [FIX] Module Definitions and STRICT Canonical Linking
@@ -163,8 +197,9 @@ fn main() {
     vm.write_memory(m2_p as usize + 8, &m1_v.to_le_bytes()).ok(); // m2.Prev -> m1
 
     // MDL (Memory Descriptor List) Linking @ 0x20
-    let md_v: [u64; 5] = [LPB_VBASE + 0x7000, LPB_VBASE + 0x7100, LPB_VBASE + 0x7200, LPB_VBASE + 0x7300, LPB_VBASE + 0x7400];
-    let md_p: [u64; 5] = [LPB_PBASE + 0x7000, LPB_PBASE + 0x7100, LPB_PBASE + 0x7200, LPB_PBASE + 0x7300, LPB_PBASE + 0x7400];
+    // [FIX] Move to 0x20000 to avoid clash with module nodes at 0x5000~0xA000
+    let md_v: [u64; 5] = [LPB_VBASE + 0x20000, LPB_VBASE + 0x21000, LPB_VBASE + 0x22000, LPB_VBASE + 0x23000, LPB_VBASE + 0x24000];
+    let md_p: [u64; 5] = [LPB_PBASE + 0x20000, LPB_PBASE + 0x21000, LPB_PBASE + 0x22000, LPB_PBASE + 0x23000, LPB_PBASE + 0x24000];
     LoaderParameterBlock::add_memory(&mut vm, LPB_VBASE, LPB_PBASE, md_v[0], md_p[0], 0x0, 0x1000, 0).ok(); 
     LoaderParameterBlock::add_memory(&mut vm, LPB_VBASE, LPB_PBASE, md_v[1], md_p[1], 0x1000, 0x4000000 - 0x1000, 8).ok();
     LoaderParameterBlock::add_memory(&mut vm, LPB_VBASE, LPB_PBASE, md_v[2], md_p[2], 0x4000000, 0x2000000, 12).ok();
@@ -244,60 +279,56 @@ fn pe_entry_rva(pe: &pe::PeFile) -> u64 {
 
 
 fn setup_kernel_paging(vm: &mut Vm, krnl_base: u64, hal_base: u64) -> Result<(), &'static str> {
-    let pml4_p        = SYSTEM_BASE + 0x2000;
-    let pdpt_high_p   = SYSTEM_BASE + 0x3000; 
-    let pdpt_low_p    = SYSTEM_BASE + 0x6000;   // [추가] 낮은 주소(HAL)용 PDPT
-    let pd_kernel_p   = SYSTEM_BASE + 0xD000;   // 커널/LPB/GDT 통합 PD
-    let pd_hal_p      = SYSTEM_BASE + 0x14000; 
+    let paging_pbase  = SYSTEM_BASE + 0x100000; // [FIX] Isolate Paging Structures @ 0x8100000
+    let pml4_p        = paging_pbase + 0x2000;
+    let pdpt_high_p   = paging_pbase + 0x3000; 
+    let pdpt_low_p    = paging_pbase + 0x6000;   
+    let pd_kernel_p   = paging_pbase + 0xD000;   
+    let pd_hal_p      = paging_pbase + 0x14000; 
     
-    let pdpt_stack_p  = SYSTEM_BASE + 0x4000; 
-    let pd_stack_p    = SYSTEM_BASE + 0xB000;
-    let pdpt_user_p   = SYSTEM_BASE + 0x5000; 
-    let pd_user_p     = SYSTEM_BASE + 0xC000;
-    let bridge_p      = SYSTEM_BASE + 0x50000;
-    let krnl_pml4_idx = 496; // 0xFFFFF800...
+    let pdpt_stack_p  = paging_pbase + 0x4000; 
+    let pd_stack_p    = paging_pbase + 0xB000;
+    let pdpt_user_p   = paging_pbase + 0x5000; 
+    let pd_user_p     = paging_pbase + 0xC000;
+    let bridge_p      = paging_pbase + 0x50000;
+    let krnl_pml4_idx = 496; 
 
     let nx: u64 = 1 << 63;
 
-    // 1. [순서 중요] 먼저 메모리를 0으로 초기화합니다.
-    vm.write_memory(SYSTEM_BASE as usize, &[0u8; 524288])?; 
+    // 1. [FIX] Only zero the paging area, NOT SYSTEM_BASE (GDT safe)
+    vm.write_memory(paging_pbase as usize, &[0u8; 524288])?; 
     vm.write_memory(bridge_p as usize, &[0x0F, 0x01, 0xC1]).ok(); 
 
-    // 2. PML4 설정
+    // 2. PML4 설정 (Index 496, 511, 0, 509, 495, 510)
     vm.write_memory((pml4_p + krnl_pml4_idx * 8) as usize, &((pdpt_high_p | 0x3).to_le_bytes()))?;
-    vm.write_memory((pml4_p + 511 * 8) as usize, &((pdpt_high_p | 0x3).to_le_bytes()))?; // 임의 접근 대비용 매핑. (ntoskrnl)
-    vm.write_memory(pml4_p as usize, &((pdpt_low_p | 0x3).to_le_bytes()))?; // Index 0 (HAL용)
+    vm.write_memory((pml4_p + 511 * 8) as usize, &((pdpt_high_p | 0x3).to_le_bytes()))?; 
+    vm.write_memory(pml4_p as usize, &((pdpt_low_p | 0x3).to_le_bytes()))?; 
     vm.write_memory((pml4_p + 509*8) as usize, &((pdpt_stack_p | 0x3 | nx).to_le_bytes()))?;
     vm.write_memory((pml4_p + 495*8) as usize, &((pdpt_user_p | 0x7 | nx).to_le_bytes()))?;
     vm.write_memory((pml4_p + 510*8) as usize, &((pml4_p | 0x3 | nx).to_le_bytes()))?;
+    vm.write_memory((pml4_p + 493*8) as usize, &((pml4_p | 0x3 | nx).to_le_bytes()))?; 
 
     // 3. PDPT 설정
-    // High Area (0xFFFFF800_00000000 ~)
     vm.write_memory(pdpt_high_p as usize, &((pd_kernel_p | 0x3).to_le_bytes()))?;
-    
-    // Low Area (HAL: 0x1c0000000 -> Index 7)
     let hal_pdpt_idx = (hal_base >> 30) & 0x1ff;
     vm.write_memory((pdpt_low_p + hal_pdpt_idx * 8) as usize, &((pd_hal_p | 0x3).to_le_bytes()))?;
 
-    // 4. PD 설정 (물리 주소 0 ~ 1GB를 커널 가상 영역에 통째로 매핑)
-    // 이렇게 하면 KRNL_PBASE, LPB_PBASE, SYSTEM_BASE(GDT)가 자동으로 제자리에 매핑됩니다.
+    // 4. PD 설정 (물리 주소 0 ~ 1GB 통째 매핑)
     for j in 0..512 {
         let phys = j as u64 * 0x200000;
         vm.write_memory((pd_kernel_p + j * 8) as usize, &((phys | 0x83).to_le_bytes()))?;
     }
 
-    // 5. HAL 전용 PD 설정 (물리 주소 HAL_PBASE를 가상 주소 hal_base에 매핑)
+    // 5. HAL 전용 PD 설정
     let hal_pd_idx = (hal_base >> 21) & 0x1ff;
     for j in 0..32 {
         let phys = HAL_PBASE + (j as u64 * 0x200000);
         let entry_addr = pd_hal_p + (hal_pd_idx + j as u64) * 8;
         vm.write_memory(entry_addr as usize, &((phys | 0x83).to_le_bytes()))?;
     }
-
-    // APIC 매핑 (기존 유지)
     vm.write_memory((pd_hal_p + 511*8) as usize, &((0xFEE00000u64 | 0x93 | nx).to_le_bytes()))?;
 
-    // 6. 스택 및 KUSER 매핑 (기존 로직 유지)
+    // 6. 스택 및 KUSER 매핑
     vm.write_memory(pdpt_stack_p as usize, &((pd_stack_p | 0x3 | nx).to_le_bytes()))?;
     for j in 0..512 {
         let phys = STACK_PBASE + (j as u64 * 0x200000);
