@@ -283,34 +283,13 @@ impl PeFile {
 
     fn rva_to_offset(&self, rva: u32) -> Option<usize> {
         for section in &self.sections {
-            let start = section.virtual_address as u32;
+            // [FIX] Convert section VA to RVA by subtracting image_base
+            let section_rva = (section.virtual_address - self.image_base) as u32;
+            let start = section_rva;
             let end = start + section.virtual_size as u32;
+            
             if rva >= start && rva < end {
-                // RVA는 메모리 기준, Offset은 파일(Raw) 기준
-                // PointerToRawData + (RVA - VirtualAddress)
-                // 하지만 pe-rs crate의 Section 구조체에는 pointer_to_raw_data가 없습니다.
-                // 대신 우리는 전체 raw_bytes를 가지고 있으니 섹션 헤더를 직접 다시 파싱하거나
-                // 아니면 로더가 메모리에 올린 상태를 가정해야 합니다.
-                
-                // 여기서는 "파일 상의 오프셋"을 구해야 하므로, PE 헤더를 직접 읽어서 섹션 헤더의 RawPointer를 찾아야 합니다.
-                // 편의상 section.raw_data가 파일 내용과 1:1 매칭된다고 가정하기 어렵습니다 (bss 등).
-                // 따라서 가장 정확한 방법은 object crate가 파싱해준 정보를 역이용하는 것입니다.
-                
-                // object crate의 Section 구조체는 file range를 제공합니다.
-                let offset_in_sect = (rva - start) as usize;
-                if offset_in_sect < section.raw_data.len() {
-                     // 주의: 이 방식은 raw_data가 파일에서 추출된 것이라는 전제하에 작동합니다.
-                     // 하지만 정확한 파일 오프셋을 알기 위해선 섹션 헤더를 다시 읽는게 낫습니다.
-                     // 여기서는 임시로 rva를 그대로 리턴하는 것이 아니라,
-                     // "섹션 데이터 내의 인덱스"를 반환하고, 호출자가 섹션 데이터를 쓰게 하는게 맞지만
-                     // 현재 구조상 raw_bytes 전체를 가지고 있으므로 파일 오프셋 변환이 필요합니다.
-                     
-                     // [간소화] 섹션의 시작 RVA를 파일 오프셋으로 매핑하는 테이블을 만들거나
-                     // PE 헤더를 직접 순회해야 합니다. 
-                     // 여기서는 구현 복잡도를 줄이기 위해, PE 파싱 시점에 RVA->Offset 맵을 만들거나
-                     // 매번 섹션 헤더를 찾습니다.
-                     return self.find_file_offset(rva);
-                }
+                return self.find_file_offset(rva);
             }
         }
         None
@@ -327,17 +306,20 @@ impl PeFile {
             let v_addr = u32::from_le_bytes(self.raw_bytes[sect_ptr+12..sect_ptr+16].try_into().unwrap());
             let v_size = u32::from_le_bytes(self.raw_bytes[sect_ptr+8..sect_ptr+12].try_into().unwrap());
             let r_ptr = u32::from_le_bytes(self.raw_bytes[sect_ptr+20..sect_ptr+24].try_into().unwrap());
+            let r_size = u32::from_le_bytes(self.raw_bytes[sect_ptr+16..sect_ptr+20].try_into().unwrap());
             
-            // v_size는 메모리 정렬 전 크기이므로 실제 섹션 크기보다 작을 수 있음. 정렬 고려 필요하나 대략적으로 맞춤.
-            if rva >= v_addr && rva < v_addr + v_size.max(4096) { // 넉넉하게 체크
+            // [FIX] Use raw_size and virtual_size combined for better matching
+            let effective_v_size = if v_size > 0 { v_size } else { r_size };
+            
+            if rva >= v_addr && rva < v_addr + effective_v_size {
                 let delta = rva - v_addr;
                 return Some((r_ptr + delta) as usize);
             }
             sect_ptr += 40;
         }
         
-        // RVA가 헤더 영역에 있는 경우 (섹션 이전)
-        if rva < u32::from_le_bytes(self.raw_bytes[e_lfanew+24+60..e_lfanew+24+64].try_into().unwrap()) { // SizeOfHeaders
+        // RVA가 헤더 영역에 있는 경우
+        if rva < 4096 {
             return Some(rva as usize);
         }
 
