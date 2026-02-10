@@ -139,7 +139,7 @@ impl PeFile {
         let data = &self.raw_bytes;
 
         // IMAGE_EXPORT_DIRECTORY structure reading
-        let name_rva = u32::from_le_bytes(data[dir_offset+12..dir_offset+16].try_into().unwrap());
+        // let name_rva = u32::from_le_bytes(data[dir_offset+12..dir_offset+16].try_into().unwrap());
         let _base = u32::from_le_bytes(data[dir_offset+16..dir_offset+20].try_into().unwrap());
         let num_funcs = u32::from_le_bytes(data[dir_offset+20..dir_offset+24].try_into().unwrap());
         let num_names = u32::from_le_bytes(data[dir_offset+24..dir_offset+28].try_into().unwrap());

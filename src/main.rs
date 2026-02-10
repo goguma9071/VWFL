@@ -72,6 +72,13 @@ fn main() {
     let paging_pbase  = SYSTEM_BASE + 0x100000; 
     let pd_hal_p = paging_pbase + 0x14000;
     let hive_pd_idx = (hive_v >> 21) & 0x1ff;   
+
+    // [FIX] Map one extra page before the hive for safety (Prevents fault at 44FFFE98)
+    if hive_pd_idx > 0 {
+        let entry_addr = pd_hal_p + (hive_pd_idx - 1) * 8;
+        vm.write_memory(entry_addr as usize, &((hive_p as u64 | 0x83).to_le_bytes())).ok();
+    }
+
     for j in 0..((hive_size as u64 + 0x1FFFFF) / 0x200000) {
         let phys = hive_p + (j * 0x200000) as usize;
         let entry_addr = pd_hal_p + (hive_pd_idx as u64 + j) * 8;
@@ -91,7 +98,8 @@ fn main() {
     println!("\n----- KERNEL MODULE MEMORY MAP -----");
     let mut nodes = Vec::new();
     for (i, m) in kloader.modules.iter().enumerate() {
-        let offset = 0x5000 + (i as u64 * 0x1000); 
+        // [FIX] Move nodes to 0x40000 to avoid collision with KPCR(0x10000) and MDL(0x20000)
+        let offset = 0x40000 + (i as u64 * 0x1000); 
         let node_v = LPB_VBASE + offset;
         let node_p = LPB_PBASE + offset;
         

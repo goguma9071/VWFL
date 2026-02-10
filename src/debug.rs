@@ -120,7 +120,7 @@ pub fn handle_diagnostic_trap(vm: &mut Vm, vector: u8) -> Result<(), Box<dyn std
     let mut regs = vm.vcpu_fd.get_regs()?;
     
     // 1. 스택에서 예외 프레임(Trap Frame) 읽기
-    // Stack Layout: [RIP, CS, RFLAGS, RSP, SS]
+    // Stack Layout: [Error Code?] -> [RIP] -> [CS] -> [RFLAGS] -> [RSP] -> [SS]
     let rsp_phys = match virt_to_phys(regs.rsp) {
         Some(p) => p,
         None => {
@@ -129,10 +129,21 @@ pub fn handle_diagnostic_trap(vm: &mut Vm, vector: u8) -> Result<(), Box<dyn std
         }
     };
 
-    let pushed_rip  = safe_read_u64(vm, rsp_phys).unwrap_or(0);
-    // let pushed_cs   = safe_read_u64(vm, rsp_phys + 8).unwrap_or(0);
-    let old_rflags  = safe_read_u64(vm, rsp_phys + 16).unwrap_or(0);
-    let old_rsp     = safe_read_u64(vm, rsp_phys + 24).unwrap_or(0);
+    // Error Code가 스택에 푸시되는 예외 벡터 목록
+    let has_error_code = matches!(vector, 8 | 10 | 11 | 12 | 13 | 14 | 17 | 30);
+    
+    let error_code = if has_error_code {
+        safe_read_u64(vm, rsp_phys).unwrap_or(0)
+    } else {
+        0
+    };
+
+    let offset = if has_error_code { 8 } else { 0 };
+    
+    let pushed_rip  = safe_read_u64(vm, rsp_phys + offset).unwrap_or(0);
+    // let pushed_cs   = safe_read_u64(vm, rsp_phys + offset + 8).unwrap_or(0);
+    let old_rflags  = safe_read_u64(vm, rsp_phys + offset + 16).unwrap_or(0);
+    let old_rsp     = safe_read_u64(vm, rsp_phys + offset + 24).unwrap_or(0);
 
     // 2. IDT 스텁이 백업한 레지스터 복구
     let orig_rax = safe_read_u64(vm, save_area_phys).unwrap_or(0);
@@ -178,6 +189,9 @@ pub fn handle_diagnostic_trap(vm: &mut Vm, vector: u8) -> Result<(), Box<dyn std
 
     // 4. 그 외 예외는 크래시로 간주하고 덤프
     println!("\n[DIAGNOSTIC] Trap triggered! Vector Number: {}", vector);
+    if has_error_code {
+        println!("Error Code   : 0x{:x}", error_code);
+    }
     println!("------------------ EXCEPTION FRAME ------------------");
     println!("FAULTING RIP: 0x{:016x}", pushed_rip);
     println!("STACK DUMP   : 0x{:016x} (Phys: 0x{:x})", regs.rsp, rsp_phys);
