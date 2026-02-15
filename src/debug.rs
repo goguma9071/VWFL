@@ -39,8 +39,10 @@ pub fn dump_all_registers(vm: &mut Vm) -> Result<(), Box<dyn std::error::Error>>
     }
     println!("CS: 0x{:x}  SS: 0x{:x}  DS: 0x{:x}", sregs.cs.selector, sregs.ss.selector, sregs.ds.selector);
     println!("---------------------------------------------------");
-    println!("Hex Dump at 0x{:x}:", SYSTEM_BASE + 0x60000);
-    hex_dump_bytes(vm, SYSTEM_BASE + 0x60000, 0x100);
+    
+    // [FIX] 예외 저장 영역 대신 진짜 LPB(0x4000000)를 덤프하여 리스트 연결을 확인합니다.
+    println!("Hex Dump of LPB at 0x{:x}:", 0x4000000);
+    hex_dump_bytes(vm, 0x4000000, 0x100);
     println!("END------------");
 
     Ok(())
@@ -50,23 +52,33 @@ pub fn handle_guest_debug(vm: &mut Vm) -> Result<(), Box<dyn std::error::Error>>
     let mut regs = vm.vcpu_fd.get_regs()?;
     let start_rip = regs.rip;
 
-    //1. traslate virtual to physical
+    // 1. 가상 주소를 물리 주소로 변환 시도
     let phys_rip = match virt_to_phys(start_rip) {
         Some(p) => p,
         None => {
-            println!("[DEBUG] RIP 0x{:016x} not mapped! (Failed to translate)", start_rip);
-            return Ok(());
+            // [방어] 변환 실패 시 하위 32비트가 유효한 물리 주소인지 도박 시도 (Identity 매핑 가정)
+            let guest_phys_guess = start_rip & 0x1FFF_FFFF; 
+            if guest_phys_guess < MEM_SIZE as u64 {
+                guest_phys_guess
+            } else {
+                // 정말 모르겠다면 RIP를 1바이트 강제 전진시켜 무한 루프 탈출
+                println!("[DEBUG] RIP 0x{:016x} translation failed. Forcing +1 skip.", start_rip);
+                regs.rip += 1;
+                vm.vcpu_fd.set_regs(&regs)?;
+                return Ok(());
+            }
         }
     };
-    
-    
 
     let opcode = match safe_read_bytes(vm, phys_rip, 2) {
         Ok(bytes) => bytes,
-        Err(_) => return Ok(()), // 메모리 범위 초과 시 무시
+        Err(_) => {
+            regs.rip += 1;
+            vm.vcpu_fd.set_regs(&regs)?;
+            return Ok(());
+        }
     };
 
-    println!("[DEBUG] GuestDebug at 0x{:016x} | Instruction: 0x{:02x}", start_rip, opcode[0]);
     // 3. 명령어 스킵 로직
     let mut final_rip = start_rip;
 
@@ -79,48 +91,37 @@ pub fn handle_guest_debug(vm: &mut Vm) -> Result<(), Box<dyn std::error::Error>>
     } else if opcode[0] == 0xCD && opcode[1] == 0x2D {
         // INT 2D (Windows Kernel Debug)
         final_rip += 2;
+    } else {
+        // [중요] 만약 Debug Exit가 났는데 알려진 INT 3 코드가 아니라면?
+        // 싱글 스텝의 결과일 수도 있으므로 강제로 전진하지 않고 리턴합니다.
+        return Ok(());
     }
 
-    // [GREEDY SKIP] Continue skipping CC padding
-     // 4. 연속된 INT 3 (CC) 스킵 (Greedy Skip) - 패딩 건너뛰기
-    // 주의: 루프 돌 때마다 물리 주소 재계산 필요 (페이지 경계 넘을 수 있음)
+    // CC 패딩 스킵 (Greedy Skip)
     loop {
         let current_phys = match virt_to_phys(final_rip) {
             Some(p) => p,
             None => break,
         };
-        
         match safe_read_bytes(vm, current_phys, 1) {
             Ok(b) if b[0] == 0xCC => final_rip += 1,
             _ => break,
         }
     }
 
-    // 5. RIP 업데이트 및 검증
     if final_rip != start_rip {
-        println!("[DEBUG] Advanced RIP: 0x{:016x} -> 0x{:016x}", start_rip, final_rip);
         regs.rip = final_rip;
         vm.vcpu_fd.set_regs(&regs)?;
-        
-        // Double Check
-        let verify = vm.vcpu_fd.get_regs()?;
-        if verify.rip != final_rip {
-            eprintln!("[ERROR] Failed to update RIP!");
-        }
     }
 
     Ok(())
 }
 
 pub fn handle_diagnostic_trap(vm: &mut Vm, vector: u8) -> Result<(), Box<dyn std::error::Error>> {
-    // IDT 스텁이 레지스터를 저장한 영역 (SYSTEM_BASE + 0x60000)
-    // virt_to_phys를 거치지 않고 물리 주소를 직접 사용 (Identity Map 가정)
     let save_area_phys = SYSTEM_BASE + 0x60000; 
-
     let mut regs = vm.vcpu_fd.get_regs()?;
-    
     // 1. 스택에서 예외 프레임(Trap Frame) 읽기
-    // Stack Layout: [Error Code?] -> [RIP] -> [CS] -> [RFLAGS] -> [RSP] -> [SS]
+    // Stack Layout: [Error Code?] -> [RIP] -> [CS] -> [RFLAGS] -> [RSP] -> [SS]    
     let rsp_phys = match virt_to_phys(regs.rsp) {
         Some(p) => p,
         None => {
@@ -128,16 +129,9 @@ pub fn handle_diagnostic_trap(vm: &mut Vm, vector: u8) -> Result<(), Box<dyn std
             return dump_all_registers(vm);
         }
     };
-
     // Error Code가 스택에 푸시되는 예외 벡터 목록
     let has_error_code = matches!(vector, 8 | 10 | 11 | 12 | 13 | 14 | 17 | 30);
-    
-    let error_code = if has_error_code {
-        safe_read_u64(vm, rsp_phys).unwrap_or(0)
-    } else {
-        0
-    };
-
+    let error_code = if has_error_code { safe_read_u64(vm, rsp_phys).unwrap_or(0) } else { 0 };
     let offset = if has_error_code { 8 } else { 0 };
     
     let pushed_rip  = safe_read_u64(vm, rsp_phys + offset).unwrap_or(0);
@@ -202,49 +196,37 @@ pub fn handle_diagnostic_trap(vm: &mut Vm, vector: u8) -> Result<(), Box<dyn std
     dump_all_registers(vm)
 }
 
-// 안전한 물리 메모리 읽기 (경계 체크 추가)
-
 
 fn virt_to_phys(vaddr: u64) -> Option<u64> {
-    // 1. Kernel Identity Mapping Area (System Base 주변)
-    // 0xFFFFF80008000000 ~ (SYSTEM_BASE가 0x8000000일 경우)
+    // 범위를 128MB(0x8000000)로 대폭 확대하여 더 안전하게 변환합니다.
+    
+    // 1. Kernel Identity Mapping Area
     let sys_virt_base = 0xFFFFF80000000000 + SYSTEM_BASE;
-    if vaddr >= sys_virt_base && vaddr < sys_virt_base + 0x2000000 { // 32MB 범위
+    if vaddr >= sys_virt_base && vaddr < sys_virt_base + 0x8000000 { 
         return Some((vaddr - sys_virt_base) + SYSTEM_BASE);
     }
 
-    // 2. Kernel Image Area (ntoskrnl.exe)
-    if vaddr >= 0xFFFFF80000200000 && vaddr < 0xFFFFF80000200000 + 0x2000000 { // 32MB
+    // 2. Kernel Image Area
+    if vaddr >= 0xFFFFF80000200000 && vaddr < 0xFFFFF80000200000 + 0x8000000 { 
         return Some((vaddr - 0xFFFFF80000200000) + KRNL_PBASE);
     }
 
-    // 3. HAL Image Area (hal.dll)
-
-    if vaddr >= 0x1c0000000 && vaddr < 0x1c0000000 + 0x1000000 { // 16MB
+    // 3. HAL Image Area
+    if vaddr >= 0x1c0000000 && vaddr < 0x1c0000000 + 0x2000000 { 
         return Some((vaddr - 0x1c0000000) + HAL_PBASE);
     }
 
     // 4. Kernel Stack Area
-    // 매핑: 0xFFFFFA8000000000 -> STACK_PBASE
-    /*
-    if vaddr >= 0xFFFFFA8000000000 && vaddr < 0xFFFFFA8000000000 + 0x2000000 { // 32MB
-        return Some((vaddr - 0xFFFFFA8000000000) + STACK_PBASE);
-    }
-    */
-
-    // 4. Kernel Stack Area (Index 509)
-    if vaddr >= 0xFFFFFE8000000000 && vaddr < 0xFFFFFE8000000000 + 0x2000000 {
+    if vaddr >= 0xFFFFFE8000000000 && vaddr < 0xFFFFFE8000000000 + 0x8000000 {
         return Some((vaddr - 0xFFFFFE8000000000) + STACK_PBASE);
     }
 
     // 5. KUSER_SHARED_DATA Area
-    // 매핑: 0xFFFFF78000000000 -> KUSER_PBASE
     if vaddr >= 0xFFFFF78000000000 && vaddr < 0xFFFFF78000000000 + 0x200000 {
         return Some((vaddr - 0xFFFFF78000000000) + KUSER_PBASE);
     }
 
     // 6. Identity Map (Boot phase / Low memory)
-    // 0 ~ MEM_SIZE
     if vaddr < MEM_SIZE as u64 {
         return Some(vaddr);
     }
@@ -252,22 +234,16 @@ fn virt_to_phys(vaddr: u64) -> Option<u64> {
     None // 매핑되지 않은 주소
 }
 
-/// 안전하게 물리 메모리에서 u64 값을 읽습니다.
 fn safe_read_u64(vm: &Vm, paddr: u64) -> Result<u64, ()> {
-    if paddr + 8 > MEM_SIZE as u64 {
-        return Err(());
-    }
+    if paddr + 8 > MEM_SIZE as u64 { return Err(()); }
     unsafe {
         let ptr = vm.mem_ptr.add(paddr as usize);
         Ok(u64::from_le_bytes(*(ptr as *const [u8; 8])))
     }
 }
 
-/// 안전하게 물리 메모리에서 바이트 배열을 읽습니다.
 fn safe_read_bytes(vm: &Vm, paddr: u64, size: usize) -> Result<Vec<u8>, ()> {
-    if paddr + size as u64 > MEM_SIZE as u64 {
-        return Err(());
-    }
+    if paddr + size as u64 > MEM_SIZE as u64 { return Err(()); }
     let mut buf = vec![0u8; size];
     unsafe {
         let src = vm.mem_ptr.add(paddr as usize);
@@ -300,26 +276,20 @@ pub fn setup_diagnostic_idt(vm: &mut Vm) -> Result<(), Box<dyn std::error::Error
 
     for i in 0..256 {
         let mut stub = Vec::new();
-        
-        // [수정 완료] save_area -> save_area_v 로 변경
         stub.extend_from_slice(&[0x48, 0xA3]); 
         stub.extend_from_slice(&save_area_v.to_le_bytes()); 
-        
         stub.extend_from_slice(&[0x48, 0x89, 0xC8, 0x48, 0xA3]); 
         stub.extend_from_slice(&(save_area_v + 8).to_le_bytes()); 
-        
         stub.extend_from_slice(&[0x48, 0x89, 0xD0, 0x48, 0xA3]); 
         stub.extend_from_slice(&(save_area_v + 16).to_le_bytes()); 
-        
         stub.extend_from_slice(&[0xB0, i as u8, 0xE6, 0xF9, 0xF4]); 
-        
         vm.write_memory((stub_base_p + i as u64 * 64) as usize, &stub).map_err(|e| e.to_string())?;
 
         let mut entry = [0u8; 16];
         let h = stub_base_v + i as u64 * 64; 
         entry[0..2].copy_from_slice(&(h as u16).to_le_bytes()); 
         entry[2..4].copy_from_slice(&0x10u16.to_le_bytes());    
-        entry[5] = 0x8E; // [추가 권장] 0xEE는 유저모드 호출 허용. 0x8E(커널 전용)가 더 안전합니다.
+        entry[5] = 0x8E; 
         entry[6..8].copy_from_slice(&((h >> 16) as u16).to_le_bytes()); 
         entry[8..12].copy_from_slice(&((h >> 32) as u32).to_le_bytes()); 
         vm.write_memory((idt_pbase + i as u64 * 16) as usize, &entry).map_err(|e| e.to_string())?;
