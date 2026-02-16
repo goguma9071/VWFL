@@ -10,13 +10,16 @@ pub fn run(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> Result<(
     setup_long_mode(vm, krnl_entry_v, stack_v, lpb_v)?;
     dump_all_registers(vm)?;
     
-    // [FORCE DEBUG] Enable Single-Step trace
+    // [DEBUG CONFIG] k가 true면 정밀 추적 모드, false면 고속 실행 모드
+    let k = true; 
+
+    let debug_control = if k { 0x00000001 | 0x00000002 } else { 0x00000001 };
     vm.vcpu_fd.set_guest_debug(&kvm_bindings::kvm_guest_debug {
-        control: 0x00000001 | 0x00000002, 
+        control: debug_control,
         ..Default::default() 
     }).ok();
 
-    println!("\n--- KVM vCPU Start (Instruction Trace Mode) ---");
+    println!("\n--- KVM vCPU Start (Debug Mode: {}) ---", k);
 
     let mut loop_count: u64 = 0;
 
@@ -25,24 +28,35 @@ pub fn run(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> Result<(
         
         let exit_reason = vm.vcpu_fd.run()?; 
 
-        // 1. 필요한 정보를 미리 복사하여 대여 충돌 방지
+        // 1. 필수 처리 및 정보 추출 (k 값과 상관없이 I/O 응답은 수행해야 함)
         let action = match exit_reason {
-            VcpuExit::Debug(_) => LoopAction::Trace,
             VcpuExit::IoOut(addr, data) => {
                 let val = if data.is_empty() { 0 } else { data[0] };
                 if addr == 0xF9 { LoopAction::Trap(val) }
                 else if addr == 0x3F8 || addr == 0xF8 || addr == 0x80 { LoopAction::SerialOut(val) }
                 else { LoopAction::LogIoOut(addr, val) }
             }
-            VcpuExit::IoIn(addr, _) => LoopAction::LogIoIn(addr),
+            VcpuExit::IoIn(addr, data) => {
+                if !data.is_empty() {
+                    match addr {
+                        0x3F8 => data[0] = 0,
+                        0x3FA => data[0] = 1,
+                        0x3FD => data[0] = 0x60,
+                        0x3FE => data[0] = 0xB0,
+                        _ => data[0] = 0,
+                    }
+                }
+                LoopAction::LogIoIn(addr)
+            }
+            VcpuExit::Debug(_) => LoopAction::Trace,
             VcpuExit::Hlt => LoopAction::Dump("HLT".to_string()),
             VcpuExit::Shutdown => LoopAction::Dump("Shutdown (Triple Fault)".to_string()),
             _ => LoopAction::None,
         };
 
-        // 2. 이제 vcpu_fd 대여가 해제되었으므로 안전하게 레지스터 읽기 가능
+        // 2. 사후 처리 및 로깅 (k 값에 따라 로그 출력 여부 결정)
         match action {
-            LoopAction::Trace => {
+            LoopAction::Trace if k => {
                 if loop_count % 100 == 0 {
                     let regs = vm.vcpu_fd.get_regs().ok();
                     println!("[TRACE] RIP: 0x{:016x?} | Count: {}", regs.map(|r| r.rip), loop_count);
@@ -52,30 +66,31 @@ pub fn run(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> Result<(
                 print!("{}", c as char);
                 io::stdout().flush()?;
             }
-            LoopAction::LogIoOut(addr, val) => {
+            LoopAction::LogIoOut(addr, val) if k => {
                 let regs = vm.vcpu_fd.get_regs().ok();
                 println!("[IO OUT] Port: 0x{:x}, Data: 0x{:x} | RIP: 0x{:x?}", addr, val, regs.map(|r| r.rip));
             }
-            LoopAction::LogIoIn(addr) => {
+            LoopAction::LogIoIn(addr) if k => {
                 let regs = vm.vcpu_fd.get_regs().ok();
                 println!("[IO IN ] Port: 0x{:x} | RIP: 0x{:x?}", addr, regs.map(|r| r.rip));
             }
             LoopAction::Trap(v) => {
                 debug::handle_diagnostic_trap(vm, v)?;
             }
+            LoopAction::HandleDebug => {
+                debug::handle_guest_debug(vm)?;
+            }
             LoopAction::Dump(msg) => {
                 println!("\nKVM EXIT: {}", msg);
                 return debug::dump_all_registers(vm);
             }
-            LoopAction::HandleDebug => {
-                debug::handle_guest_debug(vm)?;
-            }
-            LoopAction::None => {}
+            _ => {}
         }
 
-        if loop_count % 10000 == 0 {
+        // 생존 보고 주기 보정
+        if loop_count % 100000 == 0 {
             let regs = vm.vcpu_fd.get_regs().ok();
-            println!("[DEBUG] Alive | Loop: {} | RIP: 0x{:016x?}", loop_count, regs.map(|r| r.rip));
+            println!("\n[DEBUG] Alive | Loop: {} | RIP: 0x{:016x?}", loop_count, regs.map(|r| r.rip));
         }
     }
 }

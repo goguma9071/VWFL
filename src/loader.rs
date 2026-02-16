@@ -32,10 +32,11 @@ impl KernelLoader {
         let mut p_cursor = k_pbase; 
         let mut v_cursor = 0xFFFFF80040000000; 
 
-        let essentials = ["ntoskrnl.exe", "hal.dll"];
-        for name in &essentials {
-            let fixed_v = if name.contains("ntoskrnl") { Some(k_vbase) } else { None };
-            self.load_file(vm, dir_path, name, &mut p_cursor, &mut v_cursor, fixed_v)?;
+        // [CORE FIX] hal.dll 역시 커널 영역 고정 주소(ntoskrnl 바로 뒤)에 배치 시도
+        let essentials = [("ntoskrnl.exe", Some(k_vbase)), ("hal.dll", Some(0xFFFFF80002000000))];
+        
+        for (name, fixed_v) in &essentials {
+            self.load_file(vm, dir_path, name, &mut p_cursor, &mut v_cursor, *fixed_v)?;
         }
 
         let entries = fs::read_dir(dir_path)?;
@@ -46,7 +47,9 @@ impl KernelLoader {
             if path.is_file() {
                 if let Some(fname) = path.file_name().and_then(|s| s.to_str()) {
                     let lname = fname.to_lowercase();
-                    if essentials.contains(&fname) || lname == "config" || (!lname.ends_with(".dll") && !lname.ends_with(".sys") && !lname.ends_with(".exe")) {
+                    // 필수 모듈 제외하고 나머지 로드
+                    if lname == "ntoskrnl.exe" || lname == "hal.dll" || lname == "config" || 
+                       (!lname.ends_with(".dll") && !lname.ends_with(".sys") && !lname.ends_with(".exe")) {
                         continue;
                     }
                     self.load_file(vm, dir_path, fname, &mut p_cursor, &mut v_cursor, None)?;
@@ -72,6 +75,10 @@ impl KernelLoader {
 
         let has_reloc = pe.sections.iter().any(|s| s.name == ".reloc");
         let v_base = if let Some(addr) = fixed_vbase {
+            // [FIX] fixed_vbase가 있다면 .reloc 유무와 상관없이 강제 주소 사용
+            if !has_reloc {
+                println!("[LOADER] Note: {} has no .reloc but forcing to 0x{:x}", name, addr);
+            }
             addr
         } else if !has_reloc {
             println!("[LOADER] Warning: {} has no .reloc, using preferred base 0x{:x}", name, pe.image_base);
@@ -97,68 +104,21 @@ impl KernelLoader {
         Ok(())
     }
 
-    /// 모든 모듈에 대해 IAT 바인딩을 수행합니다. (포워더 처리 포함)
     pub fn bind_all(&mut self, vm: &mut Vm) -> Result<(), &'static str> {
-        // [FIX] Use ForwarderResolver from forwarder.rs
         let resolver = crate::forwarder::ForwarderResolver::new(&self.modules);
 
         for m in &self.modules {
             let imports = m.pe.get_imports()?;
-            
             for imp in imports {
                 for func in imp.functions {
                     if let Some(addr) = resolver.resolve(&imp.dll_name, &func.name) {
                         let iat_paddr = m.p_base + func.iat_rva as u64;
                         vm.write_memory(iat_paddr as usize, &addr.to_le_bytes())?;
-                    } else {
-                        if !imp.dll_name.to_uppercase().starts_with("HALEXT") {
-                            // println!("[BIND] Unresolved: {}!{}", imp.dll_name, func.name);
-                        }
                     }
                 }
             }
         }
         Ok(())
-    }
-}
-
-pub struct SymbolMap {
-    symbols: HashMap<String, (u64, Option<String>)>,
-}
-
-impl SymbolMap {
-    pub fn new() -> Self {
-        SymbolMap { symbols: HashMap::new() }
-    }
-
-    pub fn collect_exports(&mut self, module_name: &str, pe: &PeFile, base_addr: u64) -> Result<(), &'static str> {
-        let exports = pe.get_exports()?;
-        let mod_upper = module_name.to_uppercase();
-
-        for exp in exports {
-            let key = format!("{}.{}", mod_upper, exp.name);
-            let addr = base_addr + exp.rva as u64;
-            self.symbols.insert(key, (addr, exp.forwarder));
-        }
-        Ok(())
-    }
-
-    pub fn resolve(&self, dll_name: &str, func_name: &str) -> Option<u64> {
-        let dll_stem = Path::new(dll_name).file_stem()?.to_str()?.to_uppercase();
-        let key = format!("{}.{}", dll_stem, func_name);
-        self.resolve_key(&key, 0)
-    }
-
-    fn resolve_key(&self, key: &str, depth: usize) -> Option<u64> {
-        if depth > 10 { return None; } 
-        if let Some((addr, fwd)) = self.symbols.get(key) {
-            if let Some(fwd_str) = fwd {
-                return self.resolve_key(fwd_str, depth + 1);
-            } else {
-                return Some(*addr);
-            }
-        }
-        None
     }
 }
 
@@ -171,12 +131,9 @@ pub fn load_sections(vm: &mut Vm, pe_file: &PeFile, load_pbase: u64, load_vbase:
         let phys_dest = load_pbase + rva;
         vm.write_memory(phys_dest as usize, &section.raw_data)?;
     }
+    // reloc이 없으면 apply_relocation 내부에서 조용히 리턴할 것이므로 안전합니다.
     let _ = pe_file.apply_relocation(vm, load_pbase, load_vbase); 
     
     let entry_rva = pe_file.entry_point.wrapping_sub(pe_file.image_base);
     Ok(load_vbase + entry_rva)
-}
-
-pub fn bind_imports_phys(_vm: &mut Vm, _pe: &PeFile, _p_base: u64, _symbol_map: &SymbolMap) -> Result<(), &'static str> {
-    Ok(())
 }

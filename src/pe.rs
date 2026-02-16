@@ -172,8 +172,8 @@ impl PeFile {
 
             if func_rva == 0 { continue; } // Empty entry
 
-            let ordinal = i as u16; // Base 더하기 전의 인덱스
-            let name = name_map.get(&ordinal).cloned().unwrap_or_else(|| format!("#{}", ordinal));
+            let ordinal = (i as u32 + _base) as u16; // [FIX] 실제 Ordinal (Index + Base)
+            let name = name_map.get(&(i as u16)).cloned().unwrap_or_else(|| format!("#{}", ordinal));
 
             // Forwarder Check: RVA가 Export Directory 범위 안에 있는지 확인
             let mut forwarder = None;

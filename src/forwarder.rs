@@ -35,14 +35,23 @@ impl<'a> ForwarderResolver<'a> {
         })?;
 
         // 2. 모듈의 Export Table에서 함수 검색
-        // (성능을 위해 loader에서 미리 캐싱된 해시맵을 쓰면 좋지만, 여기서는 PE를 직접 뒤짐)
         if let Ok(exports) = module.pe.get_exports() {
-            if let Some(exp) = exports.iter().find(|e| e.name == func_name) {
+            // [FIX] 이름 또는 Ordinal(#123 형식)로 심볼 찾기
+            let found_exp = if func_name.starts_with('#') {
+                if let Ok(ord) = func_name[1..].parse::<u16>() {
+                    exports.iter().find(|e| e.ordinal == ord)
+                } else {
+                    None
+                }
+            } else {
+                exports.iter().find(|e| e.name == func_name)
+            };
+
+            if let Some(exp) = found_exp {
                 // 3. 포워더인지 확인
                 if let Some(fwd_str) = &exp.forwarder {
                     // 포워더 형식: "DLLName.FunctionName" 또는 "DLLName.#Ordinal"
                     if let Some((fwd_dll, fwd_func)) = fwd_str.split_once('.') {
-                        // println!("[FWD] Redirect: {}!{} -> {}!{}", dll_name, func_name, fwd_dll, fwd_func);
                         return self.resolve_recursive(fwd_dll, fwd_func, depth + 1);
                     }
                 } else {

@@ -1,181 +1,284 @@
 // src/loaderblock.rs
 
 use crate::vm::Vm;
+use crate::nt_types::*;
+
+/// _TYPE_OF_MEMORY Enum (Windows Kernel Standard)
+#[repr(u32)]
+#[derive(Debug, Copy, Clone)]
+pub enum TYPE_OF_MEMORY {
+    LoaderFree = 0,
+    LoaderBad = 1,
+    LoaderLoadedProgram = 2,
+    LoaderFirmwareTemporary = 3,
+    LoaderFirmwarePermanent = 4,
+    LoaderOsloaderHeap = 5,
+    LoaderOsloaderStack = 6,
+    LoaderSystemCode = 7,
+    LoaderHalCode = 8,
+    LoaderBootLdrPage = 9,
+    LoaderConsoleInPage = 10,
+    LoaderConsoleOutPage = 11,
+    LoaderStartupPcrPage = 12,
+    LoaderStartupStackPage = 13,
+    LoaderStartupDataPage = 14,
+    LoaderMemoryData = 15,
+    LoaderMemoryTemp = 16,
+    LoaderMemorySpecial = 17,
+    LoaderMemoryMax = 18,
+}
+
+/// _MEMORY_ALLOCATION_DESCRIPTOR - 0x28 bytes
+#[repr(C)]
+pub struct MEMORY_ALLOCATION_DESCRIPTOR {
+    pub ListEntry: LIST_ENTRY,                          // 0x0
+    pub MemoryType: TYPE_OF_MEMORY,                     // 0x10
+    pub BasePage: ULONGLONG,                            // 0x18
+    pub PageCount: ULONGLONG,                           // 0x20
+}
+
+/// _LDR_DATA_TABLE_ENTRY - 0x120 bytes (Windows 10 x64)
+#[repr(C)]
+pub struct LDR_DATA_TABLE_ENTRY {
+    pub InLoadOrderLinks: LIST_ENTRY,                   // 0x0
+    pub InMemoryOrderLinks: LIST_ENTRY,                 // 0x10
+    pub InInitializationOrderLinks: LIST_ENTRY,         // 0x20
+    pub DllBase: PVOID,                                 // 0x30
+    pub EntryPoint: PVOID,                              // 0x38
+    pub SizeOfImage: ULONG,                             // 0x40
+    pub CheckSum: ULONG,                                // 0x44
+    pub FullDllName: UNICODE_STRING,                    // 0x48
+    pub BaseDllName: UNICODE_STRING,                    // 0x58
+    pub Flags: ULONG,                                   // 0x68
+    pub ObsoleteLoadCount: USHORT,                      // 0x6c
+    pub TlsIndex: USHORT,                               // 0x6e
+    pub HashLinks: LIST_ENTRY,                          // 0x70
+    pub TimeDateStamp: ULONG,                           // 0x80
+    pub EntryPointActivationContext: PVOID,             // 0x88
+    pub Lock: PVOID,                                    // 0x90
+    pub DdagNode: PVOID,                                // 0x98
+    pub NodeModuleLink: LIST_ENTRY,                     // 0xa0
+    pub LoadContext: PVOID,                             // 0xb0
+    pub ParentDllBase: PVOID,                           // 0xb8
+}
+
+/// _KPCR (Kernel Processor Control Region) - 0x178 bytes
+#[repr(C, align(16))]
+pub struct KPCR {
+    pub GdtBase: PVOID,                                 // 0x0
+    pub TssBase: PVOID,                                 // 0x8
+    pub UserRsp: ULONGLONG,                             // 0x10
+    pub SelfPcr: PVOID,                                 // 0x18
+    pub CurrentPrcb: PVOID,                             // 0x20
+    pub LockArray: PVOID,                               // 0x28
+    pub Used_Self: PVOID,                               // 0x30
+    pub IdtBase: PVOID,                                 // 0x38
+    pub Unused: [ULONGLONG; 2],                         // 0x40
+    pub Irql: UCHAR,                                    // 0x50
+    pub Padding: [UCHAR; 183], 
+    pub KdVersionBlock: PVOID,                          // 0x108
+}
+
+/// _KPRCB (Kernel Processor Control Block) - 0x700 bytes
+#[repr(C, align(64))]
+pub struct KPRCB {
+    pub MxCsr: ULONG,                                   // 0x0
+    pub LegacyNumber: UCHAR,                            // 0x4
+    pub ReservedMustBeZero: UCHAR,                      // 0x5
+    pub InterruptRequest: UCHAR,                        // 0x6
+    pub IdleHalt: UCHAR,                                // 0x7
+    pub CurrentThread: PVOID,                           // 0x8
+    pub NextThread: PVOID,                              // 0x10
+    pub IdleThread: PVOID,                              // 0x18
+    pub NestingLevel: UCHAR,                            // 0x20
+    pub ClockOwner: UCHAR,                              // 0x21
+    pub PendingTickFlags: UCHAR,                        // 0x22
+    pub IdleState: UCHAR,                               // 0x23
+    pub Number: ULONG,                                  // 0x24
+    pub RspBase: ULONGLONG,                             // 0x28
+    pub PrcbLock: ULONGLONG,                            // 0x30
+    pub PriorityState: PVOID,                           // 0x38
+    pub CpuType: UCHAR,                                 // 0x40
+    pub CpuID: UCHAR,                                   // 0x41
+    pub CpuStep: USHORT,                                // 0x42
+    pub MHz: ULONG,                                     // 0x44
+    pub HalReserved: [ULONGLONG; 8],                    // 0x48
+    pub MinorVersion: USHORT,                           // 0x88
+    pub MajorVersion: USHORT,                           // 0x8a
+    pub Reserved2: [UCHAR; 116],                        // 0x100
+    pub ProcessorState: [UCHAR; 0x5c0],                 // 0x100
+}
+
+/// _LOADER_PARAMETER_BLOCK - 0x160 bytes
+#[repr(C)]
+pub struct LOADER_PARAMETER_BLOCK {
+    pub OsMajorVersion: ULONG,                          // 0x0
+    pub OsMinorVersion: ULONG,                          // 0x4
+    pub Size: ULONG,                                    // 0x8
+    pub OsLoaderSecurityVersion: ULONG,                 // 0xc
+    pub LoadOrderListHead: LIST_ENTRY,                  // 0x10
+    pub MemoryDescriptorListHead: LIST_ENTRY,           // 0x20
+    pub BootDriverListHead: LIST_ENTRY,                 // 0x30
+    pub EarlyLaunchListHead: LIST_ENTRY,                // 0x40
+    pub CoreDriverListHead: LIST_ENTRY,                 // 0x50
+    pub CoreExtensionsDriverListHead: LIST_ENTRY,       // 0x60
+    pub TpmCoreDriverListHead: LIST_ENTRY,              // 0x70
+    pub KernelStack: ULONGLONG,                         // 0x80
+    pub Prcb: ULONGLONG,                                // 0x88
+    pub Process: ULONGLONG,                             // 0x90
+    pub Thread: ULONGLONG,                              // 0x98
+    pub KernelStackSize: ULONG,                         // 0xa0
+    pub RegistryLength: ULONG,                          // 0xa4
+    pub RegistryBase: PVOID,                            // 0xa8
+    pub ConfigurationRoot: PVOID,                       // 0xb0
+    pub ArcBootDeviceName: PVOID,                       // 0xb8
+    pub ArcHalDeviceName: PVOID,                        // 0xc0
+    pub NtBootPathName: PVOID,                          // 0xc8
+    pub NtHalPathName: PVOID,                           // 0xd0
+    pub LoadOptions: PVOID,                             // 0xd8
+    pub NlsData: PVOID,                                 // 0xe0
+    pub ArcDiskInformation: PVOID,                      // 0xe8
+    pub Extension: PVOID,                               // 0xf0
+    pub u: [u8; 0x10],                                  // 0xf8
+    pub FirmwareInformation: [u8; 0x40],                // 0x108
+    pub OsBootstatPathName: PVOID,                      // 0x148
+    pub ArcOSDataDeviceName: PVOID,                     // 0x150
+    pub ArcWindowsSysPartName: PVOID,                   // 0x158
+}
+
+/// _LOADER_PARAMETER_EXTENSION - 0xe38 bytes ( 정밀 오프셋 보정 버전 )
+#[repr(C)]
+pub struct LOADER_PARAMETER_EXTENSION {
+    pub Size: ULONG,                                    // 0x0
+    pub Profile: [UCHAR; 0x14],                         // 0x4
+    pub EmInfFileImage: PVOID,                          // 0x18
+    pub EmInfFileSize: ULONG,                           // 0x20
+    pub Padding1: [UCHAR; 0x54],                        // 0x24 -> 0x78 (AcpiTable 위치 확보)
+    pub AcpiTable: PVOID,                               // 0x78
+    pub AcpiTableSize: ULONG,                           // 0x80
+    pub Bitfields: ULONG,                               // 0x84
+    pub LoaderPerformanceData: [UCHAR; 0x60],           // 0x88 -> 0xE8
+    pub Padding2: [UCHAR; 0xAA0],                       // 0xE8 -> 0xB88 (MajorRelease 위치 확보)
+    pub MajorRelease: ULONG,                            // 0xb88
+    pub MinorRelease: ULONG,                            // 0xb8c
+}
 
 pub struct Kpcr;
-
 impl Kpcr {
     pub fn setup(vm: &mut Vm, vaddr: u64, paddr: u64, gdt_v: u64, idt_v: u64, tss_v: u64, stack_v: u64) -> Result<(), &'static str> {
+        let mut kpcr = unsafe { std::mem::zeroed::<KPCR>() };
+        let mut prcb = unsafe { std::mem::zeroed::<KPRCB>() };
+        
         let prcb_v = vaddr + 0x180;
-        let prcb_p = paddr + 0x180;
-        
         let dummy_thread_v = vaddr + 0x5000;
-        let dummy_thread_p = paddr + 0x5000;
         let dummy_process_v = vaddr + 0x6000;
-        let dummy_process_p = paddr + 0x6000;
 
-        // KPCR 및 주변 영역 초기화 (64KB)
-        vm.write_memory(paddr as usize, &[0u8; 65536])?;
-        
-        // 1. _KPCR Layout (Vergilius 19041 x64 표준 완벽 준수)
-        vm.write_memory(paddr as usize + 0x00, &gdt_v.to_le_bytes())?;    // GdtBase @ 0x00
-        vm.write_memory(paddr as usize + 0x08, &tss_v.to_le_bytes())?;    // TssBase @ 0x08
-        vm.write_memory(paddr as usize + 0x18, &vaddr.to_le_bytes())?;    // Self @ 0x18
-        vm.write_memory(paddr as usize + 0x20, &prcb_v.to_le_bytes())?;   // CurrentPrcb @ 0x20
-        vm.write_memory(paddr as usize + 0x30, &vaddr.to_le_bytes())?;    // Used_Self (NtTib.Self) @ 0x30
-        vm.write_memory(paddr as usize + 0x38, &idt_v.to_le_bytes())?;    // IdtBase @ 0x38
+        kpcr.GdtBase = gdt_v;
+        kpcr.TssBase = tss_v;
+        kpcr.SelfPcr = vaddr;
+        kpcr.CurrentPrcb = prcb_v;
+        kpcr.Used_Self = vaddr;
+        kpcr.IdtBase = idt_v;
 
-        // GS:[0x188] CurrentThread (PRCB 오프셋 상대 주소)
-        vm.write_memory(paddr as usize + 0x188, &dummy_thread_v.to_le_bytes())?;
-        
-        // 2. _KPRCB 정밀 초기화 (0x180 지점 시작)
-        vm.write_memory(prcb_p as usize + 0x00, &0x1F80u32.to_le_bytes())?;      // MxCsr @ 0x0
-        vm.write_memory(prcb_p as usize + 0x08, &dummy_thread_v.to_le_bytes())?; // CurrentThread @ 0x8
-        vm.write_memory(prcb_p as usize + 0x10, &dummy_thread_v.to_le_bytes())?; // NextThread @ 0x10
-        vm.write_memory(prcb_p as usize + 0x18, &dummy_thread_v.to_le_bytes())?; // IdleThread @ 0x18
-        vm.write_memory(prcb_p as usize + 0x28, &stack_v.to_le_bytes())?;        // RspBase @ 0x28
-        vm.write_memory(prcb_p as usize + 0x88, &1u16.to_le_bytes())?;           // MinorVersion @ 0x88
-        vm.write_memory(prcb_p as usize + 0x8A, &1u16.to_le_bytes())?;           // MajorVersion @ 0x8A
-        
-        // CurrentProcess 포인터 @ 0x40 (19041 x64)
-        vm.write_memory((prcb_p + 0x40) as usize, &dummy_process_v.to_le_bytes())?;
+        prcb.MxCsr = 0x1F80;
+        prcb.CurrentThread = dummy_thread_v;
+        prcb.NextThread = dummy_thread_v;
+        prcb.IdleThread = dummy_thread_v;
+        prcb.RspBase = stack_v;
+        prcb.MinorVersion = 1;
+        prcb.MajorVersion = 1;
 
-        // 3. _KPROCESS 기초 설정 (CR3)
+        let kpcr_bytes = unsafe { std::slice::from_raw_parts(&kpcr as *const _ as *const u8, std::mem::size_of::<KPCR>()) };
+        vm.write_memory(paddr as usize, kpcr_bytes)?;
+
+        let prcb_bytes = unsafe { std::slice::from_raw_parts(&prcb as *const _ as *const u8, std::mem::size_of::<KPRCB>()) };
+        vm.write_memory((paddr + 0x180) as usize, prcb_bytes)?;
+
         let valid_cr3 = 0x8102000u64; 
-        vm.write_memory((dummy_process_p + 0x28) as usize, &valid_cr3.to_le_bytes())?;
-
-        // 4. _KTHREAD.Process @ 0xA8
-        vm.write_memory((dummy_thread_p + 0xA8) as usize, &dummy_process_v.to_le_bytes())?;
+        vm.write_memory((paddr + 0x6000 + 0x28) as usize, &valid_cr3.to_le_bytes())?;
+        vm.write_memory((paddr + 0x5000 + 0xA8) as usize, &dummy_process_v.to_le_bytes())?;
 
         Ok(())
     }
 }
 
 pub struct LoaderParameterBlock;
-
 impl LoaderParameterBlock {
     pub fn setup(vm: &mut Vm, lpb_v: u64, lpb_p: u64, prcb_v: u64, stack_v: u64, registry_v: u64, registry_size: u32) -> Result<(), &'static str> {
-        let dummy_tree_v = lpb_v + 0x2000;
-        let arc_name_v = lpb_v + 0xA000;
-        let nt_path_v = lpb_v + 0xB000;
-        let options_v = lpb_v + 0xC000;
-        let ext_v = lpb_v + 0x8000;
-        let ext_p = lpb_p + 0x8000;
+        let mut lpb = unsafe { std::mem::zeroed::<LOADER_PARAMETER_BLOCK>() };
+        lpb.OsMajorVersion = 10;
+        lpb.Size = 0x160;
+        lpb.KernelStack = stack_v;
+        lpb.Prcb = prcb_v;
+        lpb.Process = prcb_v + 0x5e80;
+        lpb.Thread = prcb_v + 0x4e80;
+        lpb.RegistryLength = registry_size;
+        lpb.RegistryBase = registry_v;
+        lpb.ConfigurationRoot = lpb_v + 0x2000;
+        lpb.LoadOptions = lpb_v + 0xC000;
+        lpb.Extension = lpb_v + 0x8000;
 
-        // LPB 전체 초기화 (64KB)
-        vm.write_memory(lpb_p as usize, &[0u8; 65536])?;
-        
-        // [Vergilius _LOADER_PARAMETER_BLOCK x64 준수]
-        vm.write_memory(lpb_p as usize + 0x00, &10u32.to_le_bytes())?;
-        vm.write_memory(lpb_p as usize + 0x04, &0u32.to_le_bytes())?;
-        vm.write_memory(lpb_p as usize + 0x08, &0x160u32.to_le_bytes())?;
-
-        // 1. Standard List Heads (0x10 ~ 0x70)
-        for offset in [0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70] {
-            let addr = lpb_v + offset as u64;
-            vm.write_memory(lpb_p as usize + offset, &addr.to_le_bytes())?;
-            vm.write_memory(lpb_p as usize + offset + 8, &addr.to_le_bytes())?;
-        }
-        
-        // 2. 핵심 포인터 (사용자 정의 오프셋 규격 준수)
-        vm.write_memory(lpb_p as usize + 0x80, &stack_v.to_le_bytes())?;    
-        vm.write_memory(lpb_p as usize + 0x88, &prcb_v.to_le_bytes())?;     
-        vm.write_memory(lpb_p as usize + 0x90, &(prcb_v + 0x5e80).to_le_bytes())?; 
-        vm.write_memory(lpb_p as usize + 0x98, &(prcb_v + 0x4e80).to_le_bytes())?; 
-
-        // 3. Registry & Configuration (Validated by User & Vergilius)
-        vm.write_memory(lpb_p as usize + 0xA4, &registry_size.to_le_bytes())?; // Length @ 0xA4
-        vm.write_memory(lpb_p as usize + 0xA8, &registry_v.to_le_bytes())?;    // Base @ 0xA8
-        vm.write_memory(lpb_p as usize + 0xB0, &dummy_tree_v.to_le_bytes())?; 
-
-        // 4. Paths & Options
-        vm.write_memory(lpb_p as usize + 0xB8, &arc_name_v.to_le_bytes())?; 
-        vm.write_memory(lpb_p as usize + 0xC8, &nt_path_v.to_le_bytes())?;  
-        
-        let options_str = "/DEBUG /DEBUGPORT=COM1 /BAUDRATE=115200 /EMS"; 
-        let mut options_bytes = Vec::new();
-        for c in options_str.encode_utf16() { options_bytes.extend_from_slice(&c.to_le_bytes()); }
-        options_bytes.extend_from_slice(&[0, 0]); 
-        vm.write_memory((lpb_p + 0xC000) as usize, &options_bytes)?;
-        vm.write_memory(lpb_p as usize + 0xD8, &options_v.to_le_bytes())?;
-
-        // 5. Extension @ 0xF0
-        vm.write_memory(lpb_p as usize + 0xF0, &ext_v.to_le_bytes())?;
-        vm.write_memory(ext_p as usize, &0x158u32.to_le_bytes())?; 
-        vm.write_memory(ext_p as usize + 4, &5u32.to_le_bytes())?;
-
+        let bytes = unsafe { std::slice::from_raw_parts(&lpb as *const _ as *const u8, 0x160) };
+        vm.write_memory(lpb_p as usize, bytes)?;
         Ok(())
     }
 
-    pub fn set_acpi(vm: &mut Vm, lpb_p: u64, rsdp_v: u64) -> Result<(), &'static str> {
-        let ext_p = lpb_p + 0x8000;
-        vm.write_memory(ext_p as usize + 0x10, &rsdp_v.to_le_bytes())?;
+    pub fn add_memory(vm: &mut Vm, _lpb_v: u64, _lpb_p: u64, _entry_v: u64, entry_p: u64, base_addr: u64, size: u64, mem_type: u32) -> Result<(), &'static str> {
+        let mut desc = unsafe { std::mem::zeroed::<MEMORY_ALLOCATION_DESCRIPTOR>() };
+        desc.MemoryType = unsafe { std::mem::transmute(mem_type) };
+        desc.BasePage = base_addr >> 12;
+        desc.PageCount = size >> 12;
+        let bytes = unsafe { std::slice::from_raw_parts(&desc as *const _ as *const u8, 0x28) };
+        vm.write_memory(entry_p as usize, bytes)?;
         Ok(())
     }
+}
 
-    pub fn set_hardware_tables(vm: &mut Vm, lpb_p: u64, gdt_v: u64, idt_v: u64, tss_v: u64) -> Result<(), &'static str> {
-        let ext_p = lpb_p + 0x8000;
-        
-        // [Vergilius & User-Identified Layout 준수]
-        // 8-byte Base Pointers first (0x00, 0x08, 0x10 간격)
-        vm.write_memory(ext_p as usize + 0x40, &gdt_v.to_le_bytes())?;    // GdtBase @ +0x00 (Ext 0x40)
-        vm.write_memory(ext_p as usize + 0x48, &tss_v.to_le_bytes())?;    // TssBase @ +0x08 (Ext 0x48)
-        vm.write_memory(ext_p as usize + 0x50, &idt_v.to_le_bytes())?;    // IdtBase @ +0x10 (Ext 0x50)
-        
-        // 4-byte Limits follow
-        vm.write_memory(ext_p as usize + 0x58, &0xFFu32.to_le_bytes())?;  // GdtLimit @ +0x18 (Ext 0x58)
-        vm.write_memory(ext_p as usize + 0x5C, &0xFFFu32.to_le_bytes())?; // IdtLimit @ +0x1C (Ext 0x5C)
-        vm.write_memory(ext_p as usize + 0x60, &0x67u32.to_le_bytes())?;  // TssLimit @ +0x20 (Ext 0x60)
-
-        // HypervisorFlags @ 0x108 
-        vm.write_memory(ext_p as usize + 0x108, &1u32.to_le_bytes())?; 
-
+pub struct LoaderParameterExtension;
+impl LoaderParameterExtension {
+    pub const OFFSET_IN_LPB: u64 = 0x8000;
+    pub fn setup(vm: &mut Vm, ext_p: u64) -> Result<(), &'static str> {
+        let mut ext = unsafe { std::mem::zeroed::<LOADER_PARAMETER_EXTENSION>() };
+        ext.Size = 0xE38;
+        ext.MajorRelease = 10;
+        ext.MinorRelease = 0;
+        let bytes = unsafe { std::slice::from_raw_parts(&ext as *const _ as *const u8, 0xE38) };
+        vm.write_memory(ext_p as usize, bytes)?;
         Ok(())
     }
-
-    pub fn add_module(vm: &mut Vm, _lpb_v: u64, _lpb_p: u64, _entry_v: u64, entry_p: u64, 
-                      img_base: u64, entry_point: u64, size: u32, name: &str) -> Result<(), &'static str> {
-        let mut data = [0u8; 512]; 
-        
-        // [_LDR_DATA_TABLE_ENTRY x64 표준 준수]
-        data[0x30..0x38].copy_from_slice(&img_base.to_le_bytes());    // DllBase @ 0x30
-        data[0x38..0x40].copy_from_slice(&entry_point.to_le_bytes()); // EntryPoint @ 0x38
-        data[0x40..0x44].copy_from_slice(&size.to_le_bytes());        // SizeOfImage @ 0x40
-        
-        let name_v_addr = _entry_v + 0x150; 
-        let name_p_addr = entry_p + 0x150;
-        let mut utf16_name: Vec<u8> = Vec::new();
-        for c in name.encode_utf16() { utf16_name.extend_from_slice(&c.to_le_bytes()); }
-        let name_len = utf16_name.len() as u16;
-        utf16_name.extend_from_slice(&[0, 0]); 
-
-        // FullDllName (UNICODE_STRING) @ 0x48
-        data[0x48..0x4a].copy_from_slice(&name_len.to_le_bytes());
-        data[0x4a..0x4c].copy_from_slice(&(name_len + 2).to_le_bytes());
-        data[0x50..0x58].copy_from_slice(&name_v_addr.to_le_bytes());
-        
-        // BaseDllName (UNICODE_STRING) @ 0x58
-        data[0x58..0x5a].copy_from_slice(&name_len.to_le_bytes());
-        data[0x5a..0x5c].copy_from_slice(&(name_len + 2).to_le_bytes());
-        data[0x60..0x68].copy_from_slice(&name_v_addr.to_le_bytes());
-        
-        // Flags @ 0x68
-        data[0x68..0x6C].copy_from_slice(&0x40004u32.to_le_bytes()); 
-        // USHORT ObsoleteLoadCount @ 0x6C
-        data[0x6C..0x6E].copy_from_slice(&1u16.to_le_bytes());
-
-        vm.write_memory(entry_p as usize, &data)?;
-        vm.write_memory(name_p_addr as usize, &utf16_name)?;
+    pub fn set_acpi(vm: &mut Vm, ext_p: u64, rsdp_v: u64) -> Result<(), &'static str> {
+        // 구조체 필드를 통해 직접 주소 쓰기 (오프셋 0x78 보장)
+        vm.write_memory((ext_p + 0x78) as usize, &rsdp_v.to_le_bytes())?;
+        vm.write_memory((ext_p + 0x80) as usize, &36u32.to_le_bytes())?;
         Ok(())
     }
+}
 
-    pub fn add_memory(vm: &mut Vm, _lpb_v: u64, lpb_p: u64, _entry_v: u64, entry_p: u64, 
-                      base_addr: u64, size: u64, mem_type: u32) -> Result<(), &'static str> {
-        let mut data = [0u8; 64];
-        data[0x10..0x14].copy_from_slice(&mem_type.to_le_bytes());
-        data[0x18..0x20].copy_from_slice(&(base_addr >> 12).to_le_bytes());
-        data[0x20..0x28].copy_from_slice(&(size >> 12).to_le_bytes());
-        vm.write_memory(entry_p as usize, &data)?;
+pub struct LdrDataTableEntry;
+impl LdrDataTableEntry {
+    pub fn add_module(vm: &mut Vm, _entry_v: u64, entry_p: u64, img_base: u64, entry_point: u64, size: u32, name: &str) -> Result<(), &'static str> {
+        let mut ldr = unsafe { std::mem::zeroed::<LDR_DATA_TABLE_ENTRY>() };
+        ldr.DllBase = img_base;
+        ldr.EntryPoint = entry_point;
+        ldr.SizeOfImage = size;
+        ldr.Flags = 0x40004; 
+        ldr.ObsoleteLoadCount = 1;
+
+        let name_v = _entry_v + 0x150;
+        let mut name_u16: Vec<u8> = Vec::new();
+        for c in name.encode_utf16() { name_u16.extend_from_slice(&c.to_le_bytes()); }
+        let len = name_u16.len() as u16;
+
+        ldr.FullDllName.Length = len;
+        ldr.FullDllName.MaximumLength = len + 2;
+        ldr.FullDllName.Buffer = name_v;
+        ldr.BaseDllName.Length = len;
+        ldr.BaseDllName.MaximumLength = len + 2;
+        ldr.BaseDllName.Buffer = name_v;
+
+        let bytes = unsafe { std::slice::from_raw_parts(&ldr as *const _ as *const u8, 0x120) };
+        vm.write_memory(entry_p as usize, bytes)?;
+        vm.write_memory((entry_p + 0x150) as usize, &name_u16)?;
         Ok(())
     }
 }

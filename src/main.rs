@@ -6,11 +6,12 @@ mod acpi;
 mod pe;
 mod vm;
 mod forwarder;
+mod nt_types;
 
 use std::env;
 use std::fs;
 use vm::{Vm, MEM_SIZE};
-use loaderblock::{LoaderParameterBlock, Kpcr};
+use loaderblock::{LoaderParameterBlock, LoaderParameterExtension, LdrDataTableEntry, Kpcr};
 use loader::KernelLoader;
 
 // --- Physical Memory Layout ---
@@ -44,13 +45,11 @@ fn main() {
     kuser_data[0x270..0x274].copy_from_slice(&10u32.to_le_bytes());    
     vm.write_memory(KUSER_PBASE as usize, &kuser_data).ok();
 
-    // 1. 커널 로더 초기화 및 모든 모듈 로드 (자동 주소 할당)
+    // 1. 커널 로더 초기화 및 모든 모듈 로드
     let mut kloader = KernelLoader::new();
     let krnl_vbase = 0xFFFFF80000200000;
-    
     kloader.load_directory(&mut vm, sys32_path, KRNL_PBASE, krnl_vbase).expect("Failed to load modules");
 
-    // ntoskrnl과 hal의 정보 추출
     let krnl_mod = &kloader.modules[0]; 
     let hal_mod = &kloader.modules[1];
     let krnl_entry_v = krnl_mod.entry;
@@ -71,6 +70,7 @@ fn main() {
     let pd_hal_p = paging_pbase + 0x14000;
     let hive_pd_idx = (hive_v >> 21) & 0x1ff;   
 
+    // [RESTORE] Safety mapping before hive
     if hive_pd_idx > 0 {
         let entry_addr = pd_hal_p + (hive_pd_idx - 1) * 8;
         vm.write_memory(entry_addr as usize, &((hive_p as u64 | 0x83).to_le_bytes())).ok();
@@ -84,18 +84,21 @@ fn main() {
 
     let stack_v: u64 = STACK_VBASE + 0x10000; 
 
-    // 4. LPB 및 KPCR 초기화
-    LoaderParameterBlock::setup(&mut vm, LPB_VBASE, LPB_PBASE, KPCR_VBASE + 0x180, stack_v, hive_v, hive_size).expect("LPB Init");
-    
+    // 4. KPCR 및 LPB 기초 초기화
     let gdt_v: u64 = K_VIRT_ANY + SYSTEM_BASE;
     let idt_v: u64 = gdt_v + 0x20000; 
     let tss_v: u64 = gdt_v + 0x1000;
+    
     Kpcr::setup(&mut vm, KPCR_VBASE, KPCR_PBASE, gdt_v, idt_v, tss_v, stack_v).expect("KPCR Init");
-
+    LoaderParameterBlock::setup(&mut vm, LPB_VBASE, LPB_PBASE, KPCR_VBASE + 0x180, stack_v, hive_v, hive_size).expect("LPB Init");
+    
+    // 5. ACPI 및 Extension 초기화
     let rsdp_v = acpi::setup(&mut vm, ACPI_PBASE, ACPI_VBASE).expect("ACPI failed");
-    LoaderParameterBlock::set_acpi(&mut vm, LPB_PBASE, rsdp_v).ok();
+    let ext_p = LPB_PBASE + LoaderParameterExtension::OFFSET_IN_LPB;
+    LoaderParameterExtension::setup(&mut vm, ext_p).expect("Extension Init");
+    LoaderParameterExtension::set_acpi(&mut vm, ext_p, rsdp_v).ok();
 
-    // 5. LPB 모듈 리스트 등록
+    // 6. LPB 모듈 리스트 등록 및 연결
     println!("\n----- KERNEL MODULE MEMORY MAP -----");
     let mut nodes = Vec::new();
     for (i, m) in kloader.modules.iter().enumerate() {
@@ -105,34 +108,29 @@ fn main() {
         
         println!("[MAP] {:<20} | 0x{:016x} - 0x{:016x} | Node: 0x{:x}", m.name, m.v_base, m.v_base + m.size as u64, node_v);
         
-        LoaderParameterBlock::add_module(&mut vm, LPB_VBASE, LPB_PBASE, node_v, node_p, m.v_base, m.entry, m.size, &m.name).ok();
+        LdrDataTableEntry::add_module(&mut vm, node_v, node_p, m.v_base, m.entry, m.size, &m.name).ok();
         nodes.push((node_v, node_p));
     }
     println!("------------------------------------\n");
 
-    // 6. 순환 리스트 연결
-    let head_v1 = LPB_VBASE + 0x10; // LoadOrderListHead
-    let head_v3 = LPB_VBASE + 0x30; // BootDriverListHead
+    // 순환 리스트 연결
+    let head_v1 = LPB_VBASE + 0x10; 
+    let head_v3 = LPB_VBASE + 0x30; 
 
-    // [List 1] LoadOrderListHead (모든 모듈 포함)
     vm.write_memory(LPB_PBASE as usize + 0x10, &nodes[0].0.to_le_bytes()).ok(); 
     vm.write_memory(LPB_PBASE as usize + 0x18, &nodes.last().unwrap().0.to_le_bytes()).ok(); 
-
-    // [List 3] BootDriverListHead (ntoskrnl 제외, hal.dll부터 포함)
+    
     if nodes.len() > 1 {
         vm.write_memory(LPB_PBASE as usize + 0x30, &(nodes[1].0 + 0x20).to_le_bytes()).ok(); 
         vm.write_memory(LPB_PBASE as usize + 0x38, &(nodes.last().unwrap().0 + 0x20).to_le_bytes()).ok(); 
     }
 
     for i in 0..nodes.len() {
-        // [Link 1] InLoadOrderLinks (+0x00)
         let next_v1 = if i == nodes.len() - 1 { head_v1 } else { nodes[i+1].0 };
         let prev_v1 = if i == 0 { head_v1 } else { nodes[i-1].0 };
         vm.write_memory(nodes[i].1 as usize, &next_v1.to_le_bytes()).ok();
         vm.write_memory((nodes[i].1 + 8) as usize, &prev_v1.to_le_bytes()).ok();
 
-        // [Link 3] InInitializationOrderLinks (+0x20)
-        // ntoskrnl(nodes[0])은 BootDriver 리스트에서 제외
         if i > 0 {
             let next_v3 = if i == nodes.len() - 1 { head_v3 } else { nodes[i+1].0 + 0x20 };
             let prev_v3 = if i == 1 { head_v3 } else { nodes[i-1].0 + 0x20 };
@@ -140,14 +138,13 @@ fn main() {
             vm.write_memory((nodes[i].1 + 0x28) as usize, &prev_v3.to_le_bytes()).ok();
         }
 
-        // [Link 2] InMemoryOrderLinks (+0x10) - 자기들끼리 순환
         let next_v2 = if i == nodes.len() - 1 { nodes[0].0 + 0x10 } else { nodes[i+1].0 + 0x10 };
         let prev_v2 = if i == 0 { nodes.last().unwrap().0 + 0x10 } else { nodes[i-1].0 + 0x10 };
         vm.write_memory((nodes[i].1 + 0x10) as usize, &next_v2.to_le_bytes()).ok();
         vm.write_memory((nodes[i].1 + 0x18) as usize, &prev_v2.to_le_bytes()).ok();
     }
 
-    // 7. IAT 바인딩 (ForwarderResolver 사용)
+    // 7. IAT 바인딩
     println!("[LOADER] Binding modules (IAT Patching with Forwarder support)...");
     kloader.bind_all(&mut vm).expect("Binding failed");
 
@@ -157,9 +154,11 @@ fn main() {
     let mut gdt_entries = vec![0u64; 32];
     gdt_entries[2] = 0x00AF9A000000FFFF;
     gdt_entries[3] = 0x00CF92000000FFFF;
+    // [RESTORE] User mode GDT entries
     gdt_entries[4] = 0x00AFFA000000FFFF;
     gdt_entries[5] = 0x00CFF2000000FFFF;
     gdt_entries[6] = 0x00AFFA000000FFFF;
+
     let tss_low = (0x00 << 56) | (0x00 << 52) | (0x89 << 40) | ((tss_p & 0xFFFFFF) << 16) | (0x67);
     let tss_high = tss_p >> 32;
     gdt_entries[8] = tss_low; gdt_entries[9] = tss_high;
@@ -167,12 +166,7 @@ fn main() {
         vm.write_memory((SYSTEM_BASE + i as u64 * 8) as usize, &entry.to_le_bytes()).ok();
     }
 
-    let gdt_v: u64 = K_VIRT_ANY + SYSTEM_BASE;
-    let idt_v: u64 = gdt_v + 0x20000; 
-    let tss_v: u64 = gdt_v + 0x1000;
-    LoaderParameterBlock::set_hardware_tables(&mut vm, LPB_PBASE, gdt_v, idt_v, tss_v).ok();
-
-    // 9. MDL 리스트 연결 (MemoryDescriptorListHead @ 0x20)
+    // 9. MDL 리스트 연결
     let mem_head_v = LPB_VBASE + 0x20;
     let md_v: [u64; 5] = [LPB_VBASE + 0x20000, LPB_VBASE + 0x21000, LPB_VBASE + 0x22000, LPB_VBASE + 0x23000, LPB_VBASE + 0x24000];
     let md_p: [u64; 5] = [LPB_PBASE + 0x20000, LPB_PBASE + 0x21000, LPB_PBASE + 0x22000, LPB_PBASE + 0x23000, LPB_PBASE + 0x24000];
@@ -191,6 +185,7 @@ fn main() {
 
     debug::setup_diagnostic_idt(&mut vm).expect("IDT failed");
 
+    // [RESTORE] Entry Point Verification
     let mut verify_code = [0u8; 16];
     vm.read_memory(0xb92010, &mut verify_code).ok();
     println!("[CHECK] Code at Entry (Phys 0xB92010): {:02X?}", verify_code);
@@ -200,11 +195,12 @@ fn main() {
     }
 }
 
+// [RESTORE] PE Helper
 fn pe_entry_rva(pe: &pe::PeFile) -> u64 {
     if pe.entry_point >= pe.image_base { pe.entry_point - pe.image_base } else { pe.entry_point }
 }
 
-fn setup_kernel_paging(vm: &mut Vm, krnl_base: u64, hal_base: u64) -> Result<(), &'static str> {
+fn setup_kernel_paging(vm: &mut Vm, _krnl_base: u64, hal_base: u64) -> Result<(), &'static str> {
     let paging_pbase  = SYSTEM_BASE + 0x100000; 
     let pml4_p        = paging_pbase + 0x2000;
     let pdpt_high_p   = paging_pbase + 0x3000; 
