@@ -2,9 +2,7 @@
  
 use crate::pe::PeFile;
 use crate::vm::Vm;
-use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
 
 /// 로드된 모듈의 메타데이터
 pub struct LoadedModule {

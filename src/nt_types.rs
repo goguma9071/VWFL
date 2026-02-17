@@ -3,8 +3,6 @@
 #![allow(non_snake_case)]
 #![allow(non_camel_case_types)]
 
-use core::ffi::c_void;
-
 // Windows 커널 기본 타입 정의
 pub type UCHAR = u8;
 pub type USHORT = u16;
@@ -37,6 +35,16 @@ pub struct GUID {
     pub Data2: u16,
     pub Data3: u16,
     pub Data4: [u8; 8],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct NLS_DATA_BLOCK {
+    pub AnsiCodePageData: PVOID,      // ANSI 테이블 주소
+    pub OemCodePageData: PVOID,       // OEM 테이블 주소
+    pub UnicodeCaseTableData: PVOID,  // 대소문자 변환 테이블 주소
+    pub AppXDefaultRegion: PVOID,
+    pub DefaultLocale: PVOID,
 }
 
 #[repr(C)]

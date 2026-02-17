@@ -37,6 +37,21 @@ fn main() {
     let sys32_path = if args.len() > 1 { &args[1] } else { "./KrnlFile" };
 
     println!("-----Initializing VWFL Hypervisor-----");
+    
+    // [OFFSET CHECK] 구조체 정렬 밀림 검사
+    unsafe {
+        use loaderblock::{KPCR, KPRCB};
+        let kpcr_ptr = std::mem::zeroed::<KPCR>();
+        let prcb_ptr = std::mem::zeroed::<KPRCB>();
+        let kpcr_base = &kpcr_ptr as *const _ as usize;
+        let prcb_base = &prcb_ptr as *const _ as usize;
+        
+        println!("[VERIFY] KPCR.KdVersionBlock Offset: 0x{:x} (Target: 0x108)", (&kpcr_ptr.KdVersionBlock as *const _ as usize) - kpcr_base);
+        println!("[VERIFY] KPRCB.MinorVersion Offset: 0x{:x} (Target: 0x88)", (&prcb_ptr.MinorVersion as *const _ as usize) - prcb_base);
+        println!("[VERIFY] KPRCB.TscFrequency Offset: 0x{:x} (Target: 0x90)", (&prcb_ptr.TscFrequency as *const _ as usize) - prcb_base);
+        println!("[VERIFY] KPRCB.ProcessorState Offset: 0x{:x} (Target: 0x100)", (&prcb_ptr.ProcessorState as *const _ as usize) - prcb_base);
+    }
+
     let mut vm = Vm::new().expect("Failed VM");
 
     // Initialize KUSER_SHARED_DATA
@@ -89,14 +104,50 @@ fn main() {
     let idt_v: u64 = gdt_v + 0x20000; 
     let tss_v: u64 = gdt_v + 0x1000;
     
+    // [FIX] 실제 NLS 데이터 로드 및 블록 초기화
+    let nls_p_base = LPB_PBASE + 0x30000;
+    let nls_v_base = LPB_VBASE + 0x30000;
+
+    let ansi_data = fs::read(format!("{}/C_1252.NLS", sys32_path)).expect("Read ANSI NLS");
+    let oem_data  = fs::read(format!("{}/C_437.NLS", sys32_path)).expect("Read OEM NLS");
+    let case_data = fs::read(format!("{}/l_intl.nls", sys32_path)).expect("Read Case NLS");
+
+    let ansi_v = nls_v_base + 0x1000;
+    let oem_v  = nls_v_base + 0x11000;
+    let case_v = nls_v_base + 0x21000;
+
+    vm.write_memory((nls_p_base + 0x1000) as usize, &ansi_data).ok();
+    vm.write_memory((nls_p_base + 0x11000) as usize, &oem_data).ok();
+    vm.write_memory((nls_p_base + 0x21000) as usize, &case_data).ok();
+
+    let nls_block = nt_types::NLS_DATA_BLOCK {
+        AnsiCodePageData: ansi_v,
+        OemCodePageData: oem_v,
+        UnicodeCaseTableData: case_v,
+        AppXDefaultRegion: 0,
+        DefaultLocale: 0,
+    };
+    let nls_bytes = unsafe { std::slice::from_raw_parts(&nls_block as *const _ as *const u8, std::mem::size_of::<nt_types::NLS_DATA_BLOCK>()) };
+    vm.write_memory(nls_p_base as usize, nls_bytes).ok();
+    
     Kpcr::setup(&mut vm, KPCR_VBASE, KPCR_PBASE, gdt_v, idt_v, tss_v, stack_v).expect("KPCR Init");
-    LoaderParameterBlock::setup(&mut vm, LPB_VBASE, LPB_PBASE, KPCR_VBASE + 0x180, stack_v, hive_v, hive_size).expect("LPB Init");
+    LoaderParameterBlock::setup(&mut vm, LPB_VBASE, LPB_PBASE, KPCR_VBASE + 0x180, stack_v, hive_v, hive_size, nls_v_base).expect("LPB Init");
     
     // 5. ACPI 및 Extension 초기화
     let rsdp_v = acpi::setup(&mut vm, ACPI_PBASE, ACPI_VBASE).expect("ACPI failed");
     let ext_p = LPB_PBASE + LoaderParameterExtension::OFFSET_IN_LPB;
     LoaderParameterExtension::setup(&mut vm, ext_p).expect("Extension Init");
     LoaderParameterExtension::set_acpi(&mut vm, ext_p, rsdp_v).ok();
+
+    // [FIX] ApiSetSchema 로드 및 연결
+    let apiset_path = format!("{}/apisetschema.dll", sys32_path);
+    if let Ok(apiset_buf) = fs::read(&apiset_path) {
+        let apiset_p = LPB_PBASE + 0x60000;
+        let apiset_v = LPB_VBASE + 0x60000;
+        vm.write_memory(apiset_p as usize, &apiset_buf).ok();
+        LoaderParameterExtension::set_apiset(&mut vm, ext_p, apiset_v, apiset_buf.len() as u32).ok();
+        println!("[LOADER] ApiSetSchema loaded (Size: 0x{:x})", apiset_buf.len());
+    }
 
     // 6. LPB 모듈 리스트 등록 및 연결
     println!("\n----- KERNEL MODULE MEMORY MAP -----");
@@ -166,20 +217,26 @@ fn main() {
         vm.write_memory((SYSTEM_BASE + i as u64 * 8) as usize, &entry.to_le_bytes()).ok();
     }
 
-    // 9. MDL 리스트 연결
+    // 9. MDL 리스트 연결 (구조체 기반 정밀 연결)
     let mem_head_v = LPB_VBASE + 0x20;
     let md_v: [u64; 5] = [LPB_VBASE + 0x20000, LPB_VBASE + 0x21000, LPB_VBASE + 0x22000, LPB_VBASE + 0x23000, LPB_VBASE + 0x24000];
     let md_p: [u64; 5] = [LPB_PBASE + 0x20000, LPB_PBASE + 0x21000, LPB_PBASE + 0x22000, LPB_PBASE + 0x23000, LPB_PBASE + 0x24000];
-    let base_map: [u64; 5] = [0x0, 0x1000, 0x4000000, 0x8100000, 0xA000000];
-    let size_map: [u64; 5] = [0x1000, 0x4000000 - 0x1000, 0x2000000, 0x100000, MEM_SIZE as u64 - 0xA000000];
-    let type_map: [u32; 5] = [0, 8, 12, 11, 1];
+    
+    // [FIX] 현실적인 메모리 맵 구성 (0:Free, 1:Bad, 7:SystemCode, 8:HalCode, 12:PCR)
+    let base_map: [u64; 5] = [0x0, 0x1000, 0x200000, 0x2000000, 0xA000000];
+    let size_map: [u64; 5] = [0x1000, 0x1FF000, 0x1E00000, 0x8000000, MEM_SIZE as u64 - 0xA000000];
+    let type_map: [u32; 5] = [1, 0, 7, 8, 0]; // 0번은 Bad, 나머지는 용도에 맞게, 큰 공간은 Free(0)
+
     for i in 0..5 {
         LoaderParameterBlock::add_memory(&mut vm, LPB_VBASE, LPB_PBASE, md_v[i], md_p[i], base_map[i], size_map[i], type_map[i]).ok();
+        
+        // Flink/Blink 연결
         let n_v = if i == 4 { mem_head_v } else { md_v[i+1] };
         let p_v = if i == 0 { mem_head_v } else { md_v[i-1] };
         vm.write_memory(md_p[i] as usize, &n_v.to_le_bytes()).ok();
         vm.write_memory((md_p[i] + 8) as usize, &p_v.to_le_bytes()).ok();
     }
+    // LPB Head 연결
     vm.write_memory(LPB_PBASE as usize + 0x20, &md_v[0].to_le_bytes()).ok(); 
     vm.write_memory(LPB_PBASE as usize + 0x28, &md_v[4].to_le_bytes()).ok(); 
 
