@@ -110,15 +110,27 @@ fn main() {
 
     let ansi_data = fs::read(format!("{}/C_1252.NLS", sys32_path)).expect("Read ANSI NLS");
     let oem_data  = fs::read(format!("{}/C_437.NLS", sys32_path)).expect("Read OEM NLS");
-    let case_data = fs::read(format!("{}/l_intl.nls", sys32_path)).expect("Read Case NLS");
+    
+    // [CORE FIX] 128KB 정밀 UpCase Table 생성 (a-z -> A-Z 매핑)
+    let mut upcase_table = vec![0u16; 65536];
+    for i in 0..65536 {
+        let c = i as u16;
+        if c >= 0x61 && c <= 0x7A { // 'a' - 'z'
+            upcase_table[i] = c - 0x20;
+        } else {
+            upcase_table[i] = c;
+        }
+    }
+    let mut upcase_bytes = Vec::with_capacity(131072);
+    for val in upcase_table { upcase_bytes.extend_from_slice(&val.to_le_bytes()); }
 
-    let ansi_v = nls_v_base + 0x1000;
-    let oem_v  = nls_v_base + 0x11000;
-    let case_v = nls_v_base + 0x21000;
+    let ansi_v = nls_v_base + 0x1000 + 0x20;  // skip header
+    let oem_v  = nls_v_base + 0x11000 + 0x20;  // also skip header
+    let case_v = nls_v_base + 0x21000; // [FIX] 생성된 128KB 테이블 주소
 
     vm.write_memory((nls_p_base + 0x1000) as usize, &ansi_data).ok();
     vm.write_memory((nls_p_base + 0x11000) as usize, &oem_data).ok();
-    vm.write_memory((nls_p_base + 0x21000) as usize, &case_data).ok();
+    vm.write_memory((nls_p_base + 0x21000) as usize, &upcase_bytes).ok(); // [FIX] 128KB 데이터 주입
 
     let nls_block = nt_types::NLS_DATA_BLOCK {
         AnsiCodePageData: ansi_v,
@@ -131,7 +143,7 @@ fn main() {
     vm.write_memory(nls_p_base as usize, nls_bytes).ok();
     
     Kpcr::setup(&mut vm, KPCR_VBASE, KPCR_PBASE, gdt_v, idt_v, tss_v, stack_v).expect("KPCR Init");
-    LoaderParameterBlock::setup(&mut vm, LPB_VBASE, LPB_PBASE, KPCR_VBASE + 0x180, stack_v, hive_v, hive_size, nls_v_base).expect("LPB Init");
+    LoaderParameterBlock::setup(&mut vm, LPB_VBASE, LPB_PBASE, KPCR_VBASE + 0x180, stack_v, 0x10000, hive_v, hive_size, nls_v_base).expect("LPB Init");
     
     // 5. ACPI 및 Extension 초기화
     let rsdp_v = acpi::setup(&mut vm, ACPI_PBASE, ACPI_VBASE).expect("ACPI failed");
@@ -217,32 +229,39 @@ fn main() {
         vm.write_memory((SYSTEM_BASE + i as u64 * 8) as usize, &entry.to_le_bytes()).ok();
     }
 
-    // 9. MDL 리스트 연결 (구조체 기반 정밀 연결)
+    // 9. MDL 리스트 연결 (6개 항목으로 확장 및 LoaderMemoryData 보호)
     let mem_head_v = LPB_VBASE + 0x20;
-    let md_v: [u64; 5] = [LPB_VBASE + 0x20000, LPB_VBASE + 0x21000, LPB_VBASE + 0x22000, LPB_VBASE + 0x23000, LPB_VBASE + 0x24000];
-    let md_p: [u64; 5] = [LPB_PBASE + 0x20000, LPB_PBASE + 0x21000, LPB_PBASE + 0x22000, LPB_PBASE + 0x23000, LPB_PBASE + 0x24000];
+    let md_v: [u64; 6] = [
+        LPB_VBASE + 0x20000, LPB_VBASE + 0x21000, LPB_VBASE + 0x22000, 
+        LPB_VBASE + 0x23000, LPB_VBASE + 0x24000, LPB_VBASE + 0x25000
+    ];
+    let md_p: [u64; 6] = [
+        LPB_PBASE + 0x20000, LPB_PBASE + 0x21000, LPB_PBASE + 0x22000, 
+        LPB_PBASE + 0x23000, LPB_PBASE + 0x24000, LPB_PBASE + 0x25000
+    ];
     
-    // [FIX] 현실적인 메모리 맵 구성 (0:Free, 1:Bad, 7:SystemCode, 8:HalCode, 12:PCR)
-    let base_map: [u64; 5] = [0x0, 0x1000, 0x200000, 0x2000000, 0xA000000];
-    let size_map: [u64; 5] = [0x1000, 0x1FF000, 0x1E00000, 0x8000000, MEM_SIZE as u64 - 0xA000000];
-    let type_map: [u32; 5] = [1, 0, 7, 8, 0]; // 0번은 Bad, 나머지는 용도에 맞게, 큰 공간은 Free(0)
+    let base_map: [u64; 6] = [0x0, 0x1000, 0x200000, 0x2000000, 0x4000000, 0x4100000];
+    let size_map: [u64; 6] = [
+        0x1000, 0x1FF000, 0x1E00000, 0x2000000, 
+        0x100000, // [FIX] 1MB (LPB + KPCR + NLS + UpCase 공간 보호)
+        MEM_SIZE as u64 - 0x4100000
+    ];
+    let type_map: [u32; 6] = [1, 0, 7, 8, 15, 0]; // 15 = LoaderMemoryData
 
-    for i in 0..5 {
+    for i in 0..6 {
         LoaderParameterBlock::add_memory(&mut vm, LPB_VBASE, LPB_PBASE, md_v[i], md_p[i], base_map[i], size_map[i], type_map[i]).ok();
         
-        // Flink/Blink 연결
-        let n_v = if i == 4 { mem_head_v } else { md_v[i+1] };
+        let n_v = if i == 5 { mem_head_v } else { md_v[i+1] };
         let p_v = if i == 0 { mem_head_v } else { md_v[i-1] };
         vm.write_memory(md_p[i] as usize, &n_v.to_le_bytes()).ok();
         vm.write_memory((md_p[i] + 8) as usize, &p_v.to_le_bytes()).ok();
     }
     // LPB Head 연결
     vm.write_memory(LPB_PBASE as usize + 0x20, &md_v[0].to_le_bytes()).ok(); 
-    vm.write_memory(LPB_PBASE as usize + 0x28, &md_v[4].to_le_bytes()).ok(); 
+    vm.write_memory(LPB_PBASE as usize + 0x28, &md_v[5].to_le_bytes()).ok(); 
 
     debug::setup_diagnostic_idt(&mut vm).expect("IDT failed");
 
-    // [RESTORE] Entry Point Verification
     let mut verify_code = [0u8; 16];
     vm.read_memory(0xb92010, &mut verify_code).ok();
     println!("[CHECK] Code at Entry (Phys 0xB92010): {:02X?}", verify_code);

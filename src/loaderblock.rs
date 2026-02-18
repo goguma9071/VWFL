@@ -1,11 +1,13 @@
 // src/loaderblock.rs
 #![allow(non_snake_case)]
+#![allow(non_camel_case_types)]
 use crate::vm::Vm;
 use crate::nt_types::*;
 
 /// _TYPE_OF_MEMORY Enum (Windows Kernel Standard)
 #[repr(u32)]
 #[derive(Debug, Copy, Clone)]
+#[allow(dead_code)]
 pub enum TYPE_OF_MEMORY {
     LoaderFree = 0,
     LoaderBad = 1,
@@ -250,7 +252,7 @@ pub struct LOADER_PARAMETER_BLOCK {
 
 pub struct LoaderParameterBlock;
 impl LoaderParameterBlock {
-    pub fn setup(vm: &mut Vm, lpb_v: u64, lpb_p: u64, prcb_v: u64, stack_v: u64, registry_v: u64, registry_size: u32, nls_v: u64) -> Result<(), &'static str> {
+    pub fn setup(vm: &mut Vm, lpb_v: u64, lpb_p: u64, prcb_v: u64, stack_v: u64, stack_size: u32, registry_v: u64, registry_size: u32, nls_v: u64) -> Result<(), &'static str> {
         let mut lpb = unsafe { std::mem::zeroed::<LOADER_PARAMETER_BLOCK>() };
         lpb.OsMajorVersion = 10;
         lpb.Size = 0x160;
@@ -258,6 +260,7 @@ impl LoaderParameterBlock {
         lpb.Prcb = prcb_v;
         lpb.Process = prcb_v + 0x5e80;
         lpb.Thread = prcb_v + 0x4e80;
+        lpb.KernelStackSize = stack_size; // [FIX] 커널 스택 크기 명시
         lpb.RegistryLength = registry_size;
         lpb.RegistryBase = registry_v;
         lpb.ConfigurationRoot = lpb_v + 0x2000;

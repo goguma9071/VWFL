@@ -8,11 +8,8 @@ use crate::debug;
 pub fn run(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> Result<(), Box<dyn std::error::Error>> {
     println!("[CPU] Initializing vCPU state...");
     setup_long_mode(vm, krnl_entry_v, stack_v, lpb_v)?;
-    dump_all_registers(vm)?;
     
-    // [DEBUG CONFIG] k가 true면 정밀 추적 모드, false면 고속 실행 모드
     let k = true; 
-
     let debug_control = if k { 0x00000001 | 0x00000002 } else { 0x00000001 };
     vm.vcpu_fd.set_guest_debug(&kvm_bindings::kvm_guest_debug {
         control: debug_control,
@@ -25,10 +22,8 @@ pub fn run(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> Result<(
 
     loop {
         loop_count += 1;
-        
         let exit_reason = vm.vcpu_fd.run()?; 
 
-        // 1. 필수 처리 및 정보 추출 (k 값과 상관없이 I/O 응답은 수행해야 함)
         let action = match exit_reason {
             VcpuExit::IoOut(addr, data) => {
                 let val = if data.is_empty() { 0 } else { data[0] };
@@ -48,38 +43,39 @@ pub fn run(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> Result<(
                 }
                 LoopAction::LogIoIn(addr)
             }
+             // [CORE FIX] MMIO 처리 추가 (APIC, 타이머 등 하드웨어 통신)
+            VcpuExit::MmioRead(addr, _data) => {
+                LoopAction::LogMmioRead(addr)
+            }
+            VcpuExit::MmioWrite(addr, data) => {
+                let val = if data.len() >= 4 { u32::from_le_bytes(data[0..4].try_into().unwrap()) } else { 0 };
+                LoopAction::LogMmioWrite(addr, val)
+            }
             VcpuExit::Debug(_) => LoopAction::Trace,
-            VcpuExit::Hlt => LoopAction::Dump("HLT".to_string()),
+            VcpuExit::Hlt => LoopAction::Dump("HLT (CPU Idle)".to_string()),
             VcpuExit::Shutdown => LoopAction::Dump("Shutdown (Triple Fault)".to_string()),
-            _ => LoopAction::None,
+            other => LoopAction::LogOther(format!("{:?}", other)),
         };
 
-        // 2. 사후 처리 및 로깅 (k 값에 따라 로그 출력 여부 결정)
         match action {
-            LoopAction::Trace if k => {
-                if loop_count % 100 == 0 {
-                    let regs = vm.vcpu_fd.get_regs().ok();
-                    println!("[TRACE] RIP: 0x{:016x?} | Count: {}", regs.map(|r| r.rip), loop_count);
-                }
+            LoopAction::Trace if k && loop_count % 50 == 0 => {
+                let regs = vm.vcpu_fd.get_regs().ok();
+                println!("[TRACE] RIP: 0x{:016x?} | Count: {}", regs.map(|r| r.rip), loop_count);
             }
             LoopAction::SerialOut(c) => {
                 print!("{}", c as char);
                 io::stdout().flush()?;
             }
+            LoopAction::LogMmioRead(addr) if k => {
+                println!("[MMIO READ ] Addr: 0x{:x}", addr);
+            }
+            LoopAction::LogMmioWrite(addr, val) if k => {
+                println!("[MMIO WRITE] Addr: 0x{:x}, Val: 0x{:x}", addr, val);
+            }
             LoopAction::LogIoOut(addr, val) if k => {
-                let regs = vm.vcpu_fd.get_regs().ok();
-                println!("[IO OUT] Port: 0x{:x}, Data: 0x{:x} | RIP: 0x{:x?}", addr, val, regs.map(|r| r.rip));
+                println!("[IO OUT] Port: 0x{:x}, Data: 0x{:x}", addr, val);
             }
-            LoopAction::LogIoIn(addr) if k => {
-                let regs = vm.vcpu_fd.get_regs().ok();
-                println!("[IO IN ] Port: 0x{:x} | RIP: 0x{:x?}", addr, regs.map(|r| r.rip));
-            }
-            LoopAction::Trap(v) => {
-                debug::handle_diagnostic_trap(vm, v)?;
-            }
-            LoopAction::HandleDebug => {
-                debug::handle_guest_debug(vm)?;
-            }
+            LoopAction::Trap(v) => debug::handle_diagnostic_trap(vm, v)?,
             LoopAction::Dump(msg) => {
                 println!("\nKVM EXIT: {}", msg);
                 return debug::dump_all_registers(vm);
@@ -87,8 +83,7 @@ pub fn run(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> Result<(
             _ => {}
         }
 
-        // 생존 보고 주기 보정
-        if loop_count % 100000 == 0 {
+        if loop_count % 10000 == 0 {
             let regs = vm.vcpu_fd.get_regs().ok();
             println!("\n[DEBUG] Alive | Loop: {} | RIP: 0x{:016x?}", loop_count, regs.map(|r| r.rip));
         }
@@ -101,8 +96,10 @@ enum LoopAction {
     SerialOut(u8),
     LogIoOut(u16, u8),
     LogIoIn(u16),
+    LogMmioRead(u64),
+    LogMmioWrite(u64, u32),
+    LogOther(String),
     Trap(u8),
-    HandleDebug,
     Dump(String),
 }
 
@@ -117,43 +114,41 @@ fn setup_long_mode(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> 
     
     let mut cpuid = vm.kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)?;
     for entry in cpuid.as_mut_slice() {
-        if entry.function == 0x1 {
-            entry.ecx &= !(1 << 31); 
-        }
-        if entry.function == 0x40000000 {
-            entry.ebx = 0; entry.ecx = 0; entry.edx = 0;
-        }
+        if entry.function == 0x1 { entry.ecx &= !(1 << 31); }
+        if entry.function == 0x40000000 { entry.ebx = 0; entry.ecx = 0; entry.edx = 0; }
         if entry.function == 0x80000001 { entry.edx |= 1 << 20; }
     }
     vm.vcpu_fd.set_cpuid2(&cpuid)?;
 
+    // --- GDT Setup ---
     let mut gdt: [u64; 32] = [0; 32];
     gdt[1] = 0x00af9a000000ffff; 
     gdt[2] = 0x00af9a000000ffff; 
     gdt[3] = 0x00cf92000000ffff; 
     gdt[4] = 0x00affb000000ffff; 
     gdt[5] = 0x00cff3000000ffff; 
-    gdt[10] = 0x00cff3000000ffff; 
+    gdt[10] = 0x00cff3000000ffff; // [RESTORED]
 
     let tss_limit = 104 - 1;
     let tss_low = (tss_vbase & 0xffffff) << 16 | (tss_vbase & 0xff000000) << 32 | 0x0000890000000000 | tss_limit;
     let tss_high = tss_vbase >> 32;
-    gdt[8] = tss_low;
-    gdt[9] = tss_high;
+    gdt[8] = tss_low; gdt[9] = tss_high;
 
     let mut gdt_bytes = Vec::new();
     for entry in &gdt { gdt_bytes.extend_from_slice(&entry.to_le_bytes()); }
-    vm.write_memory(gdt_pbase as usize, &gdt_bytes)?;
+    vm.write_memory(gdt_pbase as usize, &gdt_bytes)?; // [RESTORED]
 
+    // --- TSS Setup ---
     let mut tss = [0u8; 104];
     tss[4..12].copy_from_slice(&stack_v.to_le_bytes()); 
-    for i in 0..7 {
+    for i in 0..7 { // [RESTORED] IST Setup
         let offset = 36 + (i * 8);
         tss[offset..offset+8].copy_from_slice(&stack_v.to_le_bytes());
     }
     vm.write_memory(tss_pbase as usize, &tss)?;
 
-    vm.vcpu_fd.set_fpu(&kvm_bindings::kvm_fpu::default())?;
+    vm.vcpu_fd.set_fpu(&kvm_bindings::kvm_fpu::default())?; // [RESTORED]
+
     let mut sregs = vm.vcpu_fd.get_sregs()?;
     sregs.cr3 = gdt_pbase + 0x100000 + 0x2000;
     sregs.cr4 = (1 << 5) | (1 << 9) | (1 << 10) | (1 << 16); 
@@ -161,24 +156,25 @@ fn setup_long_mode(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> 
     sregs.cr0 = (1 << 31) | (1 << 0) | (1 << 1) | (1 << 16) | (1 << 21) | (1 << 18);
     
     sregs.gdt.base = gdt_vbase;
-    sregs.gdt.limit = (32 * 8 - 1) as u16;
+    sregs.gdt.limit = (32 * 8 - 1) as u16; // [RESTORED]
     sregs.idt.base = k_virt_base + gdt_pbase + 0x20000; 
     sregs.idt.limit = 0x0FFF;
 
-    fn seg_64(selector: u16, is_code: bool, dpl: u8) -> kvm_bindings::kvm_segment {
+    fn seg_64(selector: u16, is_code: bool) -> kvm_bindings::kvm_segment {
         kvm_bindings::kvm_segment {
             base: 0, limit: 0xffffffff, selector, present: 1,
             type_: if is_code { 11 } else { 3 },
-            s: 1, l: if is_code { 1 } else { 0 }, g: 1, db: 0, dpl,
+            s: 1, l: if is_code { 1 } else { 0 }, g: 1, db: 0, dpl: 0,
             ..kvm_bindings::kvm_segment::default()
         }
     }
-    sregs.cs = seg_64(0x10, true, 0);
-    let ds = seg_64(0x18, false, 0);
-    sregs.ds = ds; sregs.es = ds; sregs.ss = ds;
+    sregs.cs = seg_64(0x10, true);
+    let ds = seg_64(0x18, false);
+    sregs.ds = ds;
+    sregs.es = ds;
+    sregs.ss = ds;
     sregs.gs = ds;
     sregs.gs.base = kpcr_vaddr;
-
     sregs.tr = kvm_bindings::kvm_segment { 
         base: tss_vbase, limit: tss_limit as u32, selector: 0x40, 
         type_: 9, present: 1, s: 0, g: 0, dpl: 0, ..kvm_bindings::kvm_segment::default() 
@@ -189,21 +185,19 @@ fn setup_long_mode(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> 
         kvm_msr_entry { index: 0xc0000080, data: sregs.efer, ..Default::default() }, 
         kvm_msr_entry { index: 0xc0000081, data: 0x0023001000000000, ..Default::default() }, 
         kvm_msr_entry { index: 0xc0000082, data: bridge_vaddr, ..Default::default() }, 
-        kvm_msr_entry { index: 0xc0000084, data: 0x4700, ..Default::default() }, 
+        kvm_msr_entry { index: 0xc0000084, data: 0x4700, ..Default::default() }, // [RESTORED] FMASK
         kvm_msr_entry { index: 0xc0000101, data: kpcr_vaddr, ..Default::default() }, 
-        kvm_msr_entry { index: 0xc0000102, data: kpcr_vaddr, ..Default::default() }, 
-        kvm_msr_entry { index: 0x1b, data: 0xfee00000 | 0x900, ..Default::default() }, 
+        kvm_msr_entry { index: 0xc0000102, data: kpcr_vaddr, ..Default::default() }, // [RESTORED] KernelGSBase
+        kvm_msr_entry { index: 0x1b, data: 0xfee00000 | 0x900, ..Default::default() }, // [RESTORED] APIC_BASE
     ];
-    let msrs = Msrs::from_entries(&msr_entries).unwrap();
-    vm.vcpu_fd.set_msrs(&msrs).expect("Failed to set MSRs");
+    vm.vcpu_fd.set_msrs(&Msrs::from_entries(&msr_entries).unwrap()).expect("Failed to set MSRs");
 
     let mut regs = vm.vcpu_fd.get_regs()?;
     regs.rip = krnl_entry_v;
     regs.rsp = stack_v - 0x100;
     regs.rflags = 0x2;
-    regs.rcx = lpb_v; 
+    regs.rcx = lpb_v;
     regs.rdx = lpb_v; 
-
     vm.vcpu_fd.set_regs(&regs)?;
     Ok(())
 }
