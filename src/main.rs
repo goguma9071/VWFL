@@ -75,10 +75,44 @@ fn main() {
     // 3. SYSTEM 하이브 로드
     let sys_hive = fs::read(format!("{}/config/SYSTEM", sys32_path)).expect("Read SYSTEM Hive");
     let hive_size = sys_hive.len() as u32;
-    let hive_p = 0x2C00000; 
+    let hive_p = 0x4200000; // [FIX] 안전한 높은 주소로 이동
     let hive_v = 0xFFFFF80045000000; 
     vm.write_memory(hive_p, &sys_hive).expect("Write Hive");
-    println!("[DEBUG] SYSTEM Hive size: 0x{:x}", hive_size);
+    println!("[DEBUG] SYSTEM Hive size: 0x{:x} at Phys: 0x{:x}", hive_size, hive_p);
+
+    // 9. MDL 리스트 연결 (7개 항목으로 확장: Hive 영역 추가 보호)
+    let mem_head_v = LPB_VBASE + 0x20;
+    let md_v: [u64; 7] = [
+        LPB_VBASE + 0x20000, LPB_VBASE + 0x21000, LPB_VBASE + 0x22000, 
+        LPB_VBASE + 0x23000, LPB_VBASE + 0x24000, LPB_VBASE + 0x25000,
+        LPB_VBASE + 0x26000
+    ];
+    let md_p: [u64; 7] = [
+        LPB_PBASE + 0x20000, LPB_PBASE + 0x21000, LPB_PBASE + 0x22000, 
+        LPB_PBASE + 0x23000, LPB_PBASE + 0x24000, LPB_PBASE + 0x25000,
+        LPB_PBASE + 0x26000
+    ];
+    
+    let base_map: [u64; 7] = [0x0, 0x1000, 0x200000, 0x2000000, 0x4000000, 0x4200000, 0x4200000 + ((hive_size as u64 + 0xFFF) & !0xFFF)];
+    let size_map: [u64; 7] = [
+        0x1000, 0x1FF000, 0x1E00000, 0x2000000, 
+        0x200000, // LPB + NLS + ApiSet (2MB)
+        hive_size as u64, // [FIX] SYSTEM Hive 영역 보호
+        MEM_SIZE as u64 - (0x4200000 + ((hive_size as u64 + 0xFFF) & !0xFFF))
+    ];
+    let type_map: [u32; 7] = [1, 0, 7, 8, 15, 15, 0]; // 15 = LoaderMemoryData
+
+    for i in 0..7 {
+        LoaderParameterBlock::add_memory(&mut vm, LPB_VBASE, LPB_PBASE, md_v[i], md_p[i], base_map[i], size_map[i], type_map[i]).ok();
+        
+        let n_v = if i == 6 { mem_head_v } else { md_v[i+1] };
+        let p_v = if i == 0 { mem_head_v } else { md_v[i-1] };
+        vm.write_memory(md_p[i] as usize, &n_v.to_le_bytes()).ok();
+        vm.write_memory((md_p[i] + 8) as usize, &p_v.to_le_bytes()).ok();
+    }
+    // LPB Head 연결
+    vm.write_memory(LPB_PBASE as usize + 0x20, &md_v[0].to_le_bytes()).ok(); 
+    vm.write_memory(LPB_PBASE as usize + 0x28, &md_v[6].to_le_bytes()).ok(); 
     
     // Hive Mapping
     let paging_pbase  = SYSTEM_BASE + 0x100000; 
@@ -148,17 +182,23 @@ fn main() {
     // 5. ACPI 및 Extension 초기화
     let rsdp_v = acpi::setup(&mut vm, ACPI_PBASE, ACPI_VBASE).expect("ACPI failed");
     let ext_p = LPB_PBASE + LoaderParameterExtension::OFFSET_IN_LPB;
-    LoaderParameterExtension::setup(&mut vm, ext_p).expect("Extension Init");
+    let ext_v = LPB_VBASE + LoaderParameterExtension::OFFSET_IN_LPB;
+    LoaderParameterExtension::setup(&mut vm, ext_p, ext_v).expect("Extension Init");
     LoaderParameterExtension::set_acpi(&mut vm, ext_p, rsdp_v).ok();
 
-    // [FIX] ApiSetSchema 로드 및 연결
+    // [FIX] ApiSetSchema 로드 및 연결 (정밀 매핑: .apiset 섹션 가리킴)
     let apiset_path = format!("{}/apisetschema.dll", sys32_path);
     if let Ok(apiset_buf) = fs::read(&apiset_path) {
         let apiset_p = LPB_PBASE + 0x60000;
         let apiset_v = LPB_VBASE + 0x60000;
         vm.write_memory(apiset_p as usize, &apiset_buf).ok();
-        LoaderParameterExtension::set_apiset(&mut vm, ext_p, apiset_v, apiset_buf.len() as u32).ok();
-        println!("[LOADER] ApiSetSchema loaded (Size: 0x{:x})", apiset_buf.len());
+        
+        // [CORE FIX] 커널은 PE 헤더가 아닌 .apiset 데이터의 시작점(RVA 0x2000)을 기대함
+        let actual_schema_v = apiset_v + 0x2000; 
+        let actual_schema_size = apiset_buf.len() as u32 - 0x2000;
+        
+        LoaderParameterExtension::set_apiset(&mut vm, ext_p, actual_schema_v, actual_schema_size).ok();
+        println!("[LOADER] ApiSetSchema mapped to .apiset section (Addr: 0x{:x})", actual_schema_v);
     }
 
     // 6. LPB 모듈 리스트 등록 및 연결
@@ -229,36 +269,39 @@ fn main() {
         vm.write_memory((SYSTEM_BASE + i as u64 * 8) as usize, &entry.to_le_bytes()).ok();
     }
 
-    // 9. MDL 리스트 연결 (6개 항목으로 확장 및 LoaderMemoryData 보호)
+    // 9. MDL 리스트 연결 (7개 항목으로 확장 및 정밀 보호)
     let mem_head_v = LPB_VBASE + 0x20;
-    let md_v: [u64; 6] = [
+    let md_v: [u64; 7] = [
         LPB_VBASE + 0x20000, LPB_VBASE + 0x21000, LPB_VBASE + 0x22000, 
-        LPB_VBASE + 0x23000, LPB_VBASE + 0x24000, LPB_VBASE + 0x25000
+        LPB_VBASE + 0x23000, LPB_VBASE + 0x24000, LPB_VBASE + 0x25000,
+        LPB_VBASE + 0x26000
     ];
-    let md_p: [u64; 6] = [
+    let md_p: [u64; 7] = [
         LPB_PBASE + 0x20000, LPB_PBASE + 0x21000, LPB_PBASE + 0x22000, 
-        LPB_PBASE + 0x23000, LPB_PBASE + 0x24000, LPB_PBASE + 0x25000
+        LPB_PBASE + 0x23000, LPB_PBASE + 0x24000, LPB_PBASE + 0x25000,
+        LPB_PBASE + 0x26000
     ];
     
-    let base_map: [u64; 6] = [0x0, 0x1000, 0x200000, 0x2000000, 0x4000000, 0x4100000];
-    let size_map: [u64; 6] = [
-        0x1000, 0x1FF000, 0x1E00000, 0x2000000, 
-        0x100000, // [FIX] 1MB (LPB + KPCR + NLS + UpCase 공간 보호)
+    let base_map: [u64; 7] = [0x0, 0x1000, 0x200000, 0x2000000, 0x2C00000, 0x4000000, 0x4100000];
+    let size_map: [u64; 7] = [
+        0x1000, 0x1FF000, 0x1E00000, 0xC00000, // HalCode (12MB)
+        0x1400000, // [FIX] SYSTEM Hive (20MB) 보호 - LoaderMemoryData
+        0x100000,  // LPB + NLS (1MB) 보호 - LoaderMemoryData
         MEM_SIZE as u64 - 0x4100000
     ];
-    let type_map: [u32; 6] = [1, 0, 7, 8, 15, 0]; // 15 = LoaderMemoryData
+    let type_map: [u32; 7] = [1, 0, 7, 8, 15, 15, 0]; // 15 = LoaderMemoryData
 
-    for i in 0..6 {
+    for i in 0..7 {
         LoaderParameterBlock::add_memory(&mut vm, LPB_VBASE, LPB_PBASE, md_v[i], md_p[i], base_map[i], size_map[i], type_map[i]).ok();
         
-        let n_v = if i == 5 { mem_head_v } else { md_v[i+1] };
+        let n_v = if i == 6 { mem_head_v } else { md_v[i+1] };
         let p_v = if i == 0 { mem_head_v } else { md_v[i-1] };
         vm.write_memory(md_p[i] as usize, &n_v.to_le_bytes()).ok();
         vm.write_memory((md_p[i] + 8) as usize, &p_v.to_le_bytes()).ok();
     }
     // LPB Head 연결
     vm.write_memory(LPB_PBASE as usize + 0x20, &md_v[0].to_le_bytes()).ok(); 
-    vm.write_memory(LPB_PBASE as usize + 0x28, &md_v[5].to_le_bytes()).ok(); 
+    vm.write_memory(LPB_PBASE as usize + 0x28, &md_v[6].to_le_bytes()).ok(); 
 
     debug::setup_diagnostic_idt(&mut vm).expect("IDT failed");
 

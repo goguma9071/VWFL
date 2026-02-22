@@ -20,54 +20,56 @@ pub fn setup(vm: &mut Vm, base_paddr: u64, base_vaddr: u64) -> Result<u64, &'sta
     update_checksum(&mut dsdt);
     vm.write_memory(dsdt_p as usize, &dsdt)?;
 
-    // 2. MADT (Local APIC + IO APIC)
+    // 2. MADT (Multiple APIC Description Table)
     let mut madt = vec![0u8; 44];
-    write_header(&mut madt, b"APIC", 64, 1);
-    madt[36..40].copy_from_slice(&0xFEE00000u32.to_le_bytes()); 
-    madt[40..44].copy_from_slice(&1u32.to_le_bytes()); 
+    // Total Length: Header(44) + LAPIC(8) + IOAPIC(12) + ISO(10) = 74
+    write_header(&mut madt, b"APIC", 74, 2); 
+    madt[36..40].copy_from_slice(&0xFEE00000u32.to_le_bytes()); // Local APIC Phys Base
+    madt[40..44].copy_from_slice(&1u32.to_le_bytes()); // PC-AT Compatible
     
-    let lapic_entry: [u8; 8] = [0, 8, 0, 0, 1, 0, 0, 0]; 
+    // [FIX] Type 0: Processor Local APIC (ID 0)
+    let lapic_entry: [u8; 8] = [0, 8, 0, 0, 1, 0, 0, 0]; // Type, Len, ProcID, APICID(0), Flags(Enabled)
     madt.extend_from_slice(&lapic_entry);
     
-    let ioapic_entry: [u8; 12] = [1, 12, 1, 0, 0, 0, 0, 0, 0xc0, 0xfe, 0, 0]; 
+    // [FIX] Type 1: I/O APIC (ID 1, Addr 0xFEC00000)
+    let ioapic_entry: [u8; 12] = [1, 12, 1, 0, 0, 0, 0, 0, 0x00, 0xC0, 0x00, 0xFE]; 
     madt.extend_from_slice(&ioapic_entry);
+
+    // [CORE FIX] Type 2: Interrupt Source Override (ISA IRQ 0 -> GSI 2)
+    // 윈도우 타이머 인터럽트가 IOAPIC 2번 핀으로 들어옴을 명시
+    let iso_entry: [u8; 10] = [2, 10, 0, 0, 2, 0, 0, 0, 0, 0]; // Type, Len, Bus(0), Source(0), GSI(2), Flags(0)
+    madt.extend_from_slice(&iso_entry);
     
     update_checksum(&mut madt);
     vm.write_memory(madt_p as usize, &madt)?;
 
     // 3. FADT
     let mut fadt = vec![0u8; 244];
-    write_header(&mut fadt, b"FACP", 244, 4);
-    fadt[109] = 0x3; // IAPC_BOOT_ARCH
-    // [FIX] Use virtual address for DSDT pointer
-    fadt[140..148].copy_from_slice(&dsdt_v.to_le_bytes()); // X_DSDT
+    write_header(&mut fadt, b"FACP", 244, 3);
+    fadt[109] = 0x3; 
+    fadt[112..116].copy_from_slice(&0x00000401u32.to_le_bytes()); 
+    fadt[140..148].copy_from_slice(&dsdt_v.to_le_bytes()); 
     update_checksum(&mut fadt);
     vm.write_memory(fadt_p as usize, &fadt)?;
 
     // 4. XSDT
     let mut xsdt = vec![0u8; 36 + 16];
     write_header(&mut xsdt, b"XSDT", 36 + 16, 1);
-    // [FIX] Use virtual addresses for table pointers in XSDT
-    xsdt[36..44].copy_from_slice(&fadt_v.to_le_bytes()); // FADT first
-    xsdt[44..52].copy_from_slice(&madt_v.to_le_bytes()); // MADT second
+    xsdt[36..44].copy_from_slice(&fadt_v.to_le_bytes()); 
+    xsdt[44..52].copy_from_slice(&madt_v.to_le_bytes()); 
     update_checksum(&mut xsdt);
     vm.write_memory(xsdt_p as usize, &xsdt)?;
 
     // 5. RSDP
     let mut rsdp = [0u8; 36];
     rsdp[0..8].copy_from_slice(b"RSD PTR ");
-    // [FIX] Correct OEMID offset (10-16)
     rsdp[10..16].copy_from_slice(b"VWFL  "); 
-    rsdp[15] = 2; // Revision 2 (XSDT support)
-    rsdp[20..24].copy_from_slice(&36u32.to_le_bytes()); // Length
-    // [FIX] Use virtual address for XSDT pointer
+    rsdp[15] = 2; 
+    rsdp[20..24].copy_from_slice(&36u32.to_le_bytes()); 
     rsdp[24..32].copy_from_slice(&xsdt_v.to_le_bytes()); 
 
-    // RSDP Checksum 1 (First 20 bytes)
     let sum1 = rsdp[0..20].iter().fold(0u8, |acc, &x| acc.wrapping_add(x));
     rsdp[8] = (0u8).wrapping_sub(sum1);
-    
-    // RSDP Checksum 2 (Entire table)
     let sum2 = rsdp.iter().fold(0u8, |acc, &x| acc.wrapping_add(x));
     rsdp[32] = (0u8).wrapping_sub(sum2);
     

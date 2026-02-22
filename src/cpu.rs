@@ -9,7 +9,7 @@ pub fn run(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> Result<(
     println!("[CPU] Initializing vCPU state...");
     setup_long_mode(vm, krnl_entry_v, stack_v, lpb_v)?;
     
-    let k = true; 
+    let k = true; // true일시 디버그 모드 활성화 (출력 증가)
     let debug_control = if k { 0x00000001 | 0x00000002 } else { 0x00000001 };
     vm.vcpu_fd.set_guest_debug(&kvm_bindings::kvm_guest_debug {
         control: debug_control,
@@ -60,7 +60,17 @@ pub fn run(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> Result<(
         match action {
             LoopAction::Trace if k && loop_count % 50 == 0 => {
                 let regs = vm.vcpu_fd.get_regs().ok();
-                println!("[TRACE] RIP: 0x{:016x?} | Count: {}", regs.map(|r| r.rip), loop_count);
+                let rip = regs.as_ref().map(|r| r.rip).unwrap_or(0);
+                let rflags = regs.as_ref().map(|r| r.rflags).unwrap_or(0);
+
+                // [SPEED UP] 메모리 초기화 루프(memset 등) 구간은 로그 생략
+                if rip >= 0xfffff800005c4700 && rip <= 0xfffff800005c4800 {
+                    if loop_count % 1000 == 0 {
+                        println!("[TRACE] (Skipping heavy loop at 0x{:x}) | Count: {}", rip, loop_count);
+                    }
+                } else {
+                    println!("[TRACE] RIP: 0x{:016x?} | RFLAGS: 0x{:x} | Count: {}", regs.map(|r| r.rip), rflags, loop_count);
+                }
             }
             LoopAction::SerialOut(c) => {
                 print!("{}", c as char);
@@ -85,7 +95,22 @@ pub fn run(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> Result<(
 
         if loop_count % 10000 == 0 {
             let regs = vm.vcpu_fd.get_regs().ok();
-            println!("\n[DEBUG] Alive | Loop: {} | RIP: 0x{:016x?}", loop_count, regs.map(|r| r.rip));
+            let sregs = vm.vcpu_fd.get_sregs().ok();
+            let rflags = regs.as_ref().map(|r| r.rflags).unwrap_or(0);
+            let cr8 = sregs.as_ref().map(|s| s.cr8).unwrap_or(0);
+            
+            // [NEW] TSC 값 확인 (KVM MSR 읽기)
+            let mut msrs = Msrs::from_entries(&[kvm_msr_entry { index: 0x10, ..Default::default() }]).unwrap();
+            vm.vcpu_fd.get_msrs(&mut msrs).ok();
+            let tsc = msrs.as_slice()[0].data;
+
+            // KPRCB.PendingTickFlags (GS_BASE + 0x22) 읽기
+            let mut tick_flags = [0u8];
+            let prcb_p = crate::LPB_PBASE + 0x10000 + 0x180;
+            vm.read_memory((prcb_p + 0x22) as usize, &mut tick_flags).ok();
+
+            println!("\n[DEBUG] Alive | Loop: {} | RIP: 0x{:016x?} | TSC: {} | RFLAGS: 0x{:x} | CR8: {} | Tick: {}", 
+                loop_count, regs.map(|r| r.rip), tsc, rflags, cr8, tick_flags[0]);
         }
     }
 }
@@ -184,11 +209,11 @@ fn setup_long_mode(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> 
     let msr_entries = [
         kvm_msr_entry { index: 0xc0000080, data: sregs.efer, ..Default::default() }, 
         kvm_msr_entry { index: 0xc0000081, data: 0x0023001000000000, ..Default::default() }, 
-        kvm_msr_entry { index: 0xc0000082, data: bridge_vaddr, ..Default::default() }, 
-        kvm_msr_entry { index: 0xc0000084, data: 0x4700, ..Default::default() }, // [RESTORED] FMASK
+        // [FIX] LSTAR(0xc0000082)는 커널이 직접 설정하게 둠
+        kvm_msr_entry { index: 0xc0000084, data: 0x4700, ..Default::default() }, // FMASK
         kvm_msr_entry { index: 0xc0000101, data: kpcr_vaddr, ..Default::default() }, 
-        kvm_msr_entry { index: 0xc0000102, data: kpcr_vaddr, ..Default::default() }, // [RESTORED] KernelGSBase
-        kvm_msr_entry { index: 0x1b, data: 0xfee00000 | 0x900, ..Default::default() }, // [RESTORED] APIC_BASE
+        kvm_msr_entry { index: 0xc0000102, data: kpcr_vaddr, ..Default::default() }, // KernelGSBase
+        kvm_msr_entry { index: 0x1b, data: 0xfee00000 | 0x900, ..Default::default() }, // APIC_BASE
     ];
     vm.vcpu_fd.set_msrs(&Msrs::from_entries(&msr_entries).unwrap()).expect("Failed to set MSRs");
 

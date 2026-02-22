@@ -64,8 +64,11 @@ impl Vm {
         }
 
         // 5. 가상 인터럽트 컨트롤러(IRQCHIP) 및 타이머(PIT) 생성 (윈도우 필수)
-        vm_fd.create_irq_chip()?;
-        vm_fd.create_pit2(kvm_bindings::kvm_pit_config::default())?;
+        vm_fd.create_irq_chip().map_err(|e| format!("Failed to create IRQ chip: {:?}", e))?;
+        let pit_config = kvm_bindings::kvm_pit_config::default();
+        vm_fd.create_pit2(pit_config).map_err(|e| format!("Failed to create PIT2: {:?}", e))?;
+
+        println!("[VM] KVM IRQ Chip and PIT2 initialized successfully.");
 
         // 6. vCPU 생성 (ID: 0)
         let vcpu_fd = vm_fd.create_vcpu(0)?;

@@ -94,8 +94,8 @@ pub struct KSPECIAL_REGISTERS {
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct KPROCESSOR_STATE {
-    pub ContextFrame: [UCHAR; 0x4d0],
     pub SpecialRegisters: KSPECIAL_REGISTERS,
+    pub ContextFrame: [UCHAR; 0x4d0],
 }
 
 /// _KPRCB (Kernel Processor Control Block) - Build 19041 x64 정밀 오프셋
@@ -203,11 +203,48 @@ impl Kpcr {
         let kpcr_bytes = unsafe { std::slice::from_raw_parts(&kpcr as *const _ as *const u8, std::mem::size_of::<KPCR>()) };
         vm.write_memory(paddr as usize, kpcr_bytes)?;
 
-        let prcb_bytes = unsafe { std::slice::from_raw_parts(&prcb as *const _ as *const u8, std::mem::size_of::<KPRCB>()) };
-        vm.write_memory((paddr + 0x180) as usize, prcb_bytes)?;
+        // PRCB 정밀 수동 기록
+        let prcb_p = paddr + 0x180;
+        let thread_p = paddr + 0x5000;
 
-        vm.write_memory((paddr + 0x6000 + 0x28) as usize, &cr3.to_le_bytes())?;
-        vm.write_memory((paddr + 0x5000 + 0xA8) as usize, &dummy_process_v.to_le_bytes())?;
+        vm.write_memory((prcb_p + 0x24) as usize, &0u32.to_le_bytes()).ok(); // Number = 0
+        vm.write_memory((prcb_p + 0x28) as usize, &stack_v.to_le_bytes()).ok(); // RspBase
+        vm.write_memory((prcb_p + 0x8) as usize, &dummy_thread_v.to_le_bytes()).ok(); // CurrentThread
+        
+        // 1. KPRCB.GroupSetMember (Offset 0x2D8) <- 1 (BSP 활성화)
+        vm.write_memory((prcb_p + 0x2D8) as usize, &1u64.to_le_bytes()).ok();
+
+        // 2. KPRCB APIC ID 삼위일체
+        vm.write_memory((prcb_p + 0xD4) as usize, &[0u8]).ok(); // InitialApicId = 0
+        vm.write_memory((prcb_p + 0x2D0) as usize, &[0u8]).ok(); // ApicId = 0
+
+        // 3. KPROCESS.DirectoryTableBase (Offset 0x28) <- CR3
+        vm.write_memory((paddr + 0x6000 + 0x28) as usize, &cr3.to_le_bytes()).ok();
+        
+        // 4. KTHREAD 초기화 (베르길리우스 22H2 표준)
+        vm.write_memory((thread_p + 0x28) as usize, &stack_v.to_le_bytes()).ok(); // InitialStack
+        vm.write_memory((thread_p + 0x30) as usize, &(stack_v - 0x10000).to_le_bytes()).ok(); // StackLimit
+        vm.write_memory((thread_p + 0x38) as usize, &stack_v.to_le_bytes()).ok(); // StackBase
+        
+        vm.write_memory((thread_p + 0x71) as usize, &[1u8]).ok(); // Running = 1
+        
+        vm.write_memory((thread_p + 0x98) as usize, &dummy_process_v.to_le_bytes()).ok(); // ApcState.Process
+        vm.write_memory((thread_p + 0x220) as usize, &dummy_process_v.to_le_bytes()).ok(); // Process Direct Pointer
+        
+        vm.write_memory((thread_p + 0xC8) as usize, &0u64.to_le_bytes()).ok(); // WaitStatus
+        vm.write_memory((thread_p + 0x184) as usize, &[2u8]).ok(); // State = Running
+        vm.write_memory((thread_p + 0x24a) as usize, &[0u8]).ok(); // [NEW] ApcStateIndex = 0
+        vm.write_memory((thread_p + 0x283) as usize, &[0u8]).ok(); // WaitReason = Executive
+        vm.write_memory((thread_p + 0x1D0) as usize, &[1u8]).ok(); // Affinity (CombinedApicMask)
+        
+        // [CORE FIX] 9. KPRCB DispatcherReadyListHead (Offset 0x530) 초기화
+        // 32개의 우선순위 리스트 헤드를 순환 구조(자기 참조)로 만듭니다.
+        for i in 0..32 {
+            let entry_v = prcb_v + 0x530 + (i * 16);
+            let entry_p = prcb_p + 0x530 + (i * 16);
+            vm.write_memory(entry_p as usize, &entry_v.to_le_bytes()).ok(); // Flink
+            vm.write_memory((entry_p + 8) as usize, &entry_v.to_le_bytes()).ok(); // Blink
+        }
 
         Ok(())
     }
@@ -264,7 +301,14 @@ impl LoaderParameterBlock {
         lpb.RegistryLength = registry_size;
         lpb.RegistryBase = registry_v;
         lpb.ConfigurationRoot = lpb_v + 0x2000;
+        
+        // [CORE FIX] LoadOptions는 반드시 ANSI(ASCII)여야 커널이 인식함
+        let options_str = "/DEBUG /DEBUGPORT=COM1 /BAUDRATE=115200 /EMS"; 
+        let mut options_bytes = options_str.as_bytes().to_vec();
+        options_bytes.push(0); // Null terminator
+        vm.write_memory((lpb_p + 0xC000) as usize, &options_bytes).ok();
         lpb.LoadOptions = lpb_v + 0xC000;
+
         lpb.NlsData = nls_v;
         lpb.Extension = lpb_v + 0x8000;
         let bytes = unsafe { std::slice::from_raw_parts(&lpb as *const _ as *const u8, 0x160) };
@@ -305,14 +349,21 @@ pub struct LOADER_PARAMETER_EXTENSION {
 pub struct LoaderParameterExtension;
 impl LoaderParameterExtension {
     pub const OFFSET_IN_LPB: u64 = 0x8000;
-    pub fn setup(vm: &mut Vm, ext_p: u64) -> Result<(), &'static str> {
+    pub fn setup(vm: &mut Vm, ext_p: u64, ext_v: u64) -> Result<(), &'static str> {
         let mut ext = unsafe { std::mem::zeroed::<LOADER_PARAMETER_EXTENSION>() };
         ext.Size = 0xE38;
-        ext.Bitfields = 0x1; // This mean LastBootSucceeded = true, which can help with certain Windows versions that check this flag to determine if the previous boot was successful. Setting this can improve compatibility and stability during the boot process.
+        ext.Bitfields = 0x4001; // LastBootSucceeded | BootDebuggerActive
         ext.MajorRelease = 10;
         ext.MinorRelease = 0;
         let bytes = unsafe { std::slice::from_raw_parts(&ext as *const _ as *const u8, 0xE38) };
         vm.write_memory(ext_p as usize, bytes)?;
+
+        // [CORE FIX] HalExtensionModuleList (Offset 0xA18) 순환 리스트 초기화
+        let list_head_v = ext_v + 0xA18;
+        let list_head_p = ext_p + 0xA18;
+        vm.write_memory(list_head_p as usize, &list_head_v.to_le_bytes()).ok(); // Flink
+        vm.write_memory((list_head_p + 8) as usize, &list_head_v.to_le_bytes()).ok(); // Blink
+
         Ok(())
     }
     pub fn set_acpi(vm: &mut Vm, ext_p: u64, rsdp_v: u64) -> Result<(), &'static str> {
