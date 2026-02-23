@@ -22,6 +22,11 @@ pub fn run(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> Result<(
 
     loop {
         loop_count += 1;
+        
+        // [CORE FIX] 인터럽트 펜딩 여부 확인 및 주입 윈도우 설정
+        // 이 로직은 KVM이 커널의 IF(Interrupt Flag) 상태를 감시하게 하여 sti 직후 인터럽트를 주입하게 합니다.
+        // kvm-ioctls에서는 vcpu_fd.run() 호출 시 내부적으로 인터럽트가 있으면 주입을 시도합니다.
+
         let exit_reason = vm.vcpu_fd.run()?; 
 
         let action = match exit_reason {
@@ -29,6 +34,7 @@ pub fn run(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> Result<(
                 let val = if data.is_empty() { 0 } else { data[0] };
                 if addr == 0xF9 { LoopAction::Trap(val) }
                 else if addr == 0x3F8 || addr == 0xF8 || addr == 0x80 { LoopAction::SerialOut(val) }
+                else if addr >= 0x40 && addr <= 0x43 { LoopAction::LogTimer(addr, val) }
                 else { LoopAction::LogIoOut(addr, val) }
             }
             VcpuExit::IoIn(addr, data) => {
@@ -85,6 +91,9 @@ pub fn run(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> Result<(
             LoopAction::LogIoOut(addr, val) if k => {
                 println!("[IO OUT] Port: 0x{:x}, Data: 0x{:x}", addr, val);
             }
+            LoopAction::LogTimer(addr, val) => {
+                println!("[PIT TIMER] Port: 0x{:x}, Data: 0x{:x}", addr, val);
+            }
             LoopAction::Trap(v) => debug::handle_diagnostic_trap(vm, v)?,
             LoopAction::Dump(msg) => {
                 println!("\nKVM EXIT: {}", msg);
@@ -99,6 +108,17 @@ pub fn run(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> Result<(
             let rflags = regs.as_ref().map(|r| r.rflags).unwrap_or(0);
             let cr8 = sregs.as_ref().map(|s| s.cr8).unwrap_or(0);
             
+            // [NEW] KVM_RUN 구조체에서 인터럽트 윈도우 상태 직접 확인
+            let kvm_run = vm.vcpu_fd.get_kvm_run();
+            let ready_for_inj = kvm_run.ready_for_interrupt_injection;
+            let kvm_if = kvm_run.if_flag;
+            let req_window = kvm_run.request_interrupt_window;
+
+            // KVM 내부의 인터럽트 주입 상태 확인 (injected 필드 사용)
+            let vcpu_events = vm.vcpu_fd.get_vcpu_events().ok();
+            let kvm_injected = vcpu_events.as_ref().map(|e| e.interrupt.injected).unwrap_or(0);
+            let kvm_irq_nr = vcpu_events.as_ref().map(|e| e.interrupt.nr).unwrap_or(0);
+
             // [NEW] TSC 값 확인 (KVM MSR 읽기)
             let mut msrs = Msrs::from_entries(&[kvm_msr_entry { index: 0x10, ..Default::default() }]).unwrap();
             vm.vcpu_fd.get_msrs(&mut msrs).ok();
@@ -111,6 +131,8 @@ pub fn run(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> Result<(
 
             println!("\n[DEBUG] Alive | Loop: {} | RIP: 0x{:016x?} | TSC: {} | RFLAGS: 0x{:x} | CR8: {} | Tick: {}", 
                 loop_count, regs.map(|r| r.rip), tsc, rflags, cr8, tick_flags[0]);
+            println!("[KVM STAT] ReadyForInj: {} | KvmIF: {} | ReqWindow: {} | Injected: {}(#{})",
+                ready_for_inj, kvm_if, req_window, if kvm_injected > 0 { "YES" } else { "No" }, kvm_irq_nr);
         }
     }
 }
@@ -126,6 +148,7 @@ enum LoopAction {
     LogOther(String),
     Trap(u8),
     Dump(String),
+    LogTimer(u16, u8),
 }
 
 fn setup_long_mode(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> Result<(), Box<dyn std::error::Error>> {

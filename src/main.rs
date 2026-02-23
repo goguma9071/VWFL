@@ -186,6 +186,8 @@ fn main() {
     LoaderParameterExtension::setup(&mut vm, ext_p, ext_v).expect("Extension Init");
     LoaderParameterExtension::set_acpi(&mut vm, ext_p, rsdp_v).ok();
 
+    // [CORE FIX] HalExt 모듈 연결 로직 (nodes 생성 후 아래에서 처리)
+
     // [FIX] ApiSetSchema 로드 및 연결 (정밀 매핑: .apiset 섹션 가리킴)
     let apiset_path = format!("{}/apisetschema.dll", sys32_path);
     if let Ok(apiset_buf) = fs::read(&apiset_path) {
@@ -215,6 +217,31 @@ fn main() {
         nodes.push((node_v, node_p));
     }
     println!("------------------------------------\n");
+
+    // [CORE FIX] HalExtensionModuleList (Extension + 0xA18) 연결
+    let hal_ext_head_v = ext_v + 0xA18;
+    let hal_ext_head_p = ext_p + 0xA18;
+    let mut hal_ext_nodes = Vec::new();
+
+    for (i, m) in kloader.modules.iter().enumerate() {
+        if m.name.to_lowercase().contains("halext") {
+            hal_ext_nodes.push(nodes[i]); // (node_v, node_p)
+        }
+    }
+
+    if !hal_ext_nodes.is_empty() {
+        vm.write_memory(hal_ext_head_p as usize, &hal_ext_nodes[0].0.to_le_bytes()).ok();
+        vm.write_memory((hal_ext_head_p + 8) as usize, &hal_ext_nodes.last().unwrap().0.to_le_bytes()).ok();
+
+        for i in 0..hal_ext_nodes.len() {
+            let next_v = if i == hal_ext_nodes.len() - 1 { hal_ext_head_v } else { hal_ext_nodes[i+1].0 };
+            let prev_v = if i == 0 { hal_ext_head_v } else { hal_ext_nodes[i-1].0 };
+            let node_p = hal_ext_nodes[i].1;
+            vm.write_memory((node_p + 0x20) as usize, &next_v.to_le_bytes()).ok();
+            vm.write_memory((node_p + 0x28) as usize, &prev_v.to_le_bytes()).ok();
+        }
+        println!("[LOADER] Linked {} HAL Extension modules to Extension+0xA18", hal_ext_nodes.len());
+    }
 
     // 순환 리스트 연결
     let head_v1 = LPB_VBASE + 0x10; 
