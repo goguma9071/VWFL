@@ -237,6 +237,10 @@ impl Kpcr {
         vm.write_memory((thread_p + 0x283) as usize, &[0u8]).ok(); // WaitReason = Executive
         vm.write_memory((thread_p + 0x1D0) as usize, &[1u8]).ok(); // Affinity (CombinedApicMask)
         
+        // [CORE FIX] ReadySummary (Offset 0x520) 주입
+        // 스케줄러에게 "8번 우선순위(0x100)에 준비된 스레드가 있다"고 알려 유휴 상태 탈출을 유도합니다.
+        vm.write_memory((prcb_p + 0x520) as usize, &0x100u32.to_le_bytes()).ok();
+
         // [CORE FIX] 9. KPRCB DispatcherReadyListHead (Offset 0x530) 초기화
         // 32개의 우선순위 리스트 헤드를 순환 구조(자기 참조)로 만듭니다.
         for i in 0..32 {
@@ -352,7 +356,7 @@ impl LoaderParameterExtension {
     pub fn setup(vm: &mut Vm, ext_p: u64, ext_v: u64) -> Result<(), &'static str> {
         let mut ext = unsafe { std::mem::zeroed::<LOADER_PARAMETER_EXTENSION>() };
         ext.Size = 0xE38;
-        ext.Bitfields = 0x4001; // LastBootSucceeded | BootDebuggerActive
+        ext.Bitfields = 0x4000; // LastBootSucceeded
         ext.MajorRelease = 10;
         ext.MinorRelease = 0;
         let bytes = unsafe { std::slice::from_raw_parts(&ext as *const _ as *const u8, 0xE38) };

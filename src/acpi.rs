@@ -22,23 +22,28 @@ pub fn setup(vm: &mut Vm, base_paddr: u64, base_vaddr: u64) -> Result<u64, &'sta
 
     // 2. MADT (Multiple APIC Description Table)
     let mut madt = vec![0u8; 44];
-    // Total Length: Header(44) + LAPIC(8) + IOAPIC(12) + ISO(10) = 74
-    write_header(&mut madt, b"APIC", 74, 2); 
+    // Total Length: Header(44) + LAPIC(8) + IOAPIC(12) + ISO(10) + NMI(6) = 80
+    write_header(&mut madt, b"APIC", 80, 2); 
     madt[36..40].copy_from_slice(&0xFEE00000u32.to_le_bytes()); // Local APIC Phys Base
     madt[40..44].copy_from_slice(&1u32.to_le_bytes()); // PC-AT Compatible
     
-    // [FIX] Type 0: Processor Local APIC (ID 0)
-    let lapic_entry: [u8; 8] = [0, 8, 0, 0, 1, 0, 0, 0]; // Type, Len, ProcID, APICID(0), Flags(Enabled)
+    // Type 0: Processor Local APIC
+    let lapic_entry: [u8; 8] = [0, 8, 0, 0, 1, 0, 0, 0]; 
     madt.extend_from_slice(&lapic_entry);
     
-    // [FIX] Type 1: I/O APIC (ID 1, Addr 0xFEC00000)
-    let ioapic_entry: [u8; 12] = [1, 12, 1, 0, 0, 0, 0, 0, 0x00, 0xC0, 0x00, 0xFE]; 
+    // Type 1: I/O APIC (ID 1, Addr 0xFEC00000)
+    let ioapic_entry: [u8; 12] = [1, 12, 1, 0, 0, 0, 0, 0, 0x00, 0x00, 0xC0, 0xFE]; 
     madt.extend_from_slice(&ioapic_entry);
 
     // [CORE FIX] Type 2: Interrupt Source Override (ISA IRQ 0 -> GSI 2)
-    // 윈도우 타이머 인터럽트가 IOAPIC 2번 핀으로 들어옴을 명시
-    let iso_entry: [u8; 10] = [2, 10, 0, 0, 2, 0, 0, 0, 0, 0]; // Type, Len, Bus(0), Source(0), GSI(2), Flags(0)
+    // Flags: 0x5 (Active High, Edge Triggered) - 윈도우 HAL이 타이머를 정확히 인식하도록 강제합니다.
+    let iso_entry: [u8; 10] = [2, 10, 0, 0, 2, 0, 0, 0, 0x05, 0x00]; 
     madt.extend_from_slice(&iso_entry);
+
+    // [NEW] Type 4: Local APIC NMI 항목 추가
+    // 커널의 하드웨어 워치독 및 오류 감지를 위해 LINT1을 NMI로 배선합니다.
+    let nmi_entry: [u8; 6] = [4, 6, 0xFF, 0x05, 0x00, 1]; 
+    madt.extend_from_slice(&nmi_entry);
     
     update_checksum(&mut madt);
     vm.write_memory(madt_p as usize, &madt)?;

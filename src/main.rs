@@ -309,12 +309,12 @@ fn main() {
         LPB_PBASE + 0x26000
     ];
     
-    let base_map: [u64; 7] = [0x0, 0x1000, 0x200000, 0x2000000, 0x2C00000, 0x4000000, 0x4100000];
+    let base_map: [u64; 7] = [0x0, 0x1000, 0x200000, 0x2000000, 0x2C00000, 0x4000000, 0x100000000];
     let size_map: [u64; 7] = [
-        0x1000, 0x1FF000, 0x1E00000, 0xC00000, // HalCode (12MB)
-        0x1400000, // [FIX] SYSTEM Hive (20MB) 보호 - LoaderMemoryData
-        0x100000,  // LPB + NLS (1MB) 보호 - LoaderMemoryData
-        MEM_SIZE as u64 - 0x4100000
+        0x1000, 0x1FF000, 0x1E00000, 0xC00000, 
+        0x1400000, // SYSTEM Hive
+        0x100000,  // LPB + NLS
+        (MEM_SIZE as u64 - 0xC0000000) // 상위 5GB
     ];
     let type_map: [u32; 7] = [1, 0, 7, 8, 15, 15, 0]; // 15 = LoaderMemoryData
 
@@ -389,7 +389,12 @@ fn setup_kernel_paging(vm: &mut Vm, _krnl_base: u64, hal_base: u64) -> Result<()
         let entry_addr = pd_hal_p + (hal_pd_idx + j as u64) * 8;
         vm.write_memory(entry_addr as usize, &((phys | 0x83).to_le_bytes()))?;
     }
-    vm.write_memory((pd_hal_p + 511*8) as usize, &((0xFEE00000u64 | 0x93 | nx).to_le_bytes()))?;
+    
+    // [CORE FIX] MMIO 트랩 통로 개통 (APIC & IOAPIC)
+    // 윈도우 커널이 하드웨어 인터럽트 컨트롤러에 명령을 내릴 수 있도록 물리 주소를 페이지 테이블에 정확히 배선합니다.
+    // 0x193 = Present | RW | Dirty | Access | Global | PS(Large Page)
+    vm.write_memory((pd_hal_p + 510*8) as usize, &((0xFEC00000u64 | 0x193 | nx).to_le_bytes()))?;
+    vm.write_memory((pd_hal_p + 511*8) as usize, &((0xFEE00000u64 | 0x193 | nx).to_le_bytes()))?;
 
     vm.write_memory(pdpt_stack_p as usize, &((pd_stack_p | 0x3 | nx).to_le_bytes()))?;
     for j in 0..512 {

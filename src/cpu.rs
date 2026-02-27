@@ -8,8 +8,8 @@ use crate::debug;
 pub fn run(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> Result<(), Box<dyn std::error::Error>> {
     println!("[CPU] Initializing vCPU state...");
     setup_long_mode(vm, krnl_entry_v, stack_v, lpb_v)?;
-    
-    let k = true; // true일시 디버그 모드 활성화 (출력 증가)
+
+    let k = true; // true: 디버그 모드 (느림), false: 고속 모드 (빠름)
     let debug_control = if k { 0x00000001 | 0x00000002 } else { 0x00000001 };
     vm.vcpu_fd.set_guest_debug(&kvm_bindings::kvm_guest_debug {
         control: debug_control,
@@ -23,13 +23,22 @@ pub fn run(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> Result<(
     loop {
         loop_count += 1;
         
-        // [CORE FIX] 인터럽트 펜딩 여부 확인 및 주입 윈도우 설정
-        // 이 로직은 KVM이 커널의 IF(Interrupt Flag) 상태를 감시하게 하여 sti 직후 인터럽트를 주입하게 합니다.
-        // kvm-ioctls에서는 vcpu_fd.run() 호출 시 내부적으로 인터럽트가 있으면 주입을 시도합니다.
+        // [CORE FIX] Interrupt Window Exiting 활성화
+        // 윈도우가 cli 상태일 때도 타이머 신호가 유실되지 않도록 더 공격적으로 창을 요청합니다.
+        {
+            let mut kvm_run = vm.vcpu_fd.get_kvm_run();
+            // 문이 닫혀있으면(ready_for_inj == 0), 무조건 창 열기 요청을 활성화하여 sti 시점을 잡습니다.
+            if kvm_run.ready_for_interrupt_injection == 0 {
+                kvm_run.request_interrupt_window = 1;
+            } else {
+                kvm_run.request_interrupt_window = 0;
+            }
+        }
 
         let exit_reason = vm.vcpu_fd.run()?; 
 
         let action = match exit_reason {
+            VcpuExit::IrqWindowOpen => LoopAction::Trace,
             VcpuExit::IoOut(addr, data) => {
                 let val = if data.is_empty() { 0 } else { data[0] };
                 if addr == 0xF9 { LoopAction::Trap(val) }
@@ -49,13 +58,24 @@ pub fn run(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> Result<(
                 }
                 LoopAction::LogIoIn(addr)
             }
-             // [CORE FIX] MMIO 처리 추가 (APIC, 타이머 등 하드웨어 통신)
             VcpuExit::MmioRead(addr, _data) => {
-                LoopAction::LogMmioRead(addr)
+                if addr >= 0xfee00000 && addr <= 0xfee00fff {
+                    LoopAction::LogApic(addr, 0, false)
+                } else if addr >= 0xfec00000 && addr <= 0xfec00fff {
+                    LoopAction::LogIoApic(addr, 0, false)
+                } else {
+                    LoopAction::LogMmioRead(addr)
+                }
             }
             VcpuExit::MmioWrite(addr, data) => {
                 let val = if data.len() >= 4 { u32::from_le_bytes(data[0..4].try_into().unwrap()) } else { 0 };
-                LoopAction::LogMmioWrite(addr, val)
+                if addr >= 0xfee00000 && addr <= 0xfee00fff {
+                    LoopAction::LogApic(addr, val, true)
+                } else if addr >= 0xfec00000 && addr <= 0xfec00fff {
+                    LoopAction::LogIoApic(addr, val, true)
+                } else {
+                    LoopAction::LogMmioWrite(addr, val)
+                }
             }
             VcpuExit::Debug(_) => LoopAction::Trace,
             VcpuExit::Hlt => LoopAction::Dump("HLT (CPU Idle)".to_string()),
@@ -82,17 +102,34 @@ pub fn run(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> Result<(
                 print!("{}", c as char);
                 io::stdout().flush()?;
             }
-            LoopAction::LogMmioRead(addr) if k => {
+            LoopAction::LogMmioRead(addr) => {
                 println!("[MMIO READ ] Addr: 0x{:x}", addr);
             }
-            LoopAction::LogMmioWrite(addr, val) if k => {
+            LoopAction::LogMmioWrite(addr, val) => {
                 println!("[MMIO WRITE] Addr: 0x{:x}, Val: 0x{:x}", addr, val);
             }
-            LoopAction::LogIoOut(addr, val) if k => {
+            LoopAction::LogIoOut(addr, val) => {
                 println!("[IO OUT] Port: 0x{:x}, Data: 0x{:x}", addr, val);
             }
             LoopAction::LogTimer(addr, val) => {
                 println!("[PIT TIMER] Port: 0x{:x}, Data: 0x{:x}", addr, val);
+            }
+            LoopAction::LogApic(addr, val, is_write) => {
+                let reg_name = match addr & 0xFFF {
+                    0x20 => "ID", 0x30 => "VERSION", 0x80 => "TPR", 0xB0 => "EOI",
+                    0xD0 => "LDR", 0xE0 => "DFR", 0xF0 => "SVR", 0x320 => "LVT_TIMER",
+                    0x380 => "TIMER_INIT_CNT", 0x390 => "TIMER_CUR_CNT", 0x3E0 => "TIMER_DIV",
+                    _ => "UNKNOWN",
+                };
+                if is_write { println!("[APIC WRITE] Reg: {} (0x{:x}), Val: 0x{:x}", reg_name, addr, val); }
+                else { println!("[APIC READ ] Reg: {} (0x{:x})", reg_name, addr); }
+            }
+            LoopAction::LogIoApic(addr, val, is_write) => {
+                let reg_name = match addr & 0xFF {
+                    0x0 => "IOREGSEL", 0x10 => "IOWIN", _ => "IOAPIC_UNK",
+                };
+                if is_write { println!("[IOAPIC WRITE] Reg: {} (0x{:x}), Val: 0x{:x}", reg_name, addr, val); }
+                else { println!("[IOAPIC READ ] Reg: {} (0x{:x})", reg_name, addr); }
             }
             LoopAction::Trap(v) => debug::handle_diagnostic_trap(vm, v)?,
             LoopAction::Dump(msg) => {
@@ -102,12 +139,22 @@ pub fn run(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> Result<(
             _ => {}
         }
 
-        if loop_count % 10000 == 0 {
+        if !k || loop_count % 10000 == 0 {
             let regs = vm.vcpu_fd.get_regs().ok();
             let sregs = vm.vcpu_fd.get_sregs().ok();
             let rflags = regs.as_ref().map(|r| r.rflags).unwrap_or(0);
             let cr8 = sregs.as_ref().map(|s| s.cr8).unwrap_or(0);
             
+           /** // [SHOCK TEST] 강제 인터럽트 주입 (20,000 루프 시점)
+            if loop_count == 20000 {
+                println!("\n[SHOCK TEST] Injecting forced Vector 0x30 to test kernel readiness...");
+                let mut vcpu_events = vm.vcpu_fd.get_vcpu_events().ok().unwrap_or_default();
+                vcpu_events.interrupt.injected = 1;
+                vcpu_events.interrupt.nr = 0x30; // Windows Timer Vector
+                vm.vcpu_fd.set_vcpu_events(&vcpu_events).ok();
+            }
+            **/
+
             // [NEW] KVM_RUN 구조체에서 인터럽트 윈도우 상태 직접 확인
             let kvm_run = vm.vcpu_fd.get_kvm_run();
             let ready_for_inj = kvm_run.ready_for_interrupt_injection;
@@ -149,6 +196,8 @@ enum LoopAction {
     Trap(u8),
     Dump(String),
     LogTimer(u16, u8),
+    LogApic(u64, u32, bool),
+    LogIoApic(u64, u32, bool),
 }
 
 fn setup_long_mode(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> Result<(), Box<dyn std::error::Error>> {
