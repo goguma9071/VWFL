@@ -172,7 +172,7 @@ impl Kpcr {
         kpcr.CurrentPrcb = prcb_v;
         kpcr.Used_Self = vaddr;
         kpcr.IdtBase = idt_v;
-        kpcr.StallScaleFactor = 0x0000000E; // 3.6GHz Scale Factor
+        kpcr.StallScaleFactor = 0x00000024; // 3.6GHz (3600MHz / 100) Scale Factor
 
         prcb.MxCsr = 0x1F80;
         prcb.CurrentThread = dummy_thread_v;

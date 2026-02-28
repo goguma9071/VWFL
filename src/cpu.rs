@@ -19,15 +19,15 @@ pub fn run(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> Result<(
     println!("\n--- KVM vCPU Start (Debug Mode: {}) ---", k);
 
     let mut loop_count: u64 = 0;
+    let mut last_rip: u64 = 0;
+    let mut hang_count: u32 = 0;
 
     loop {
         loop_count += 1;
         
         // [CORE FIX] Interrupt Window Exiting 활성화
-        // 윈도우가 cli 상태일 때도 타이머 신호가 유실되지 않도록 더 공격적으로 창을 요청합니다.
         {
             let mut kvm_run = vm.vcpu_fd.get_kvm_run();
-            // 문이 닫혀있으면(ready_for_inj == 0), 무조건 창 열기 요청을 활성화하여 sti 시점을 잡습니다.
             if kvm_run.ready_for_interrupt_injection == 0 {
                 kvm_run.request_interrupt_window = 1;
             } else {
@@ -55,6 +55,10 @@ pub fn run(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> Result<(
                         0x3FE => data[0] = 0xB0,
                         _ => data[0] = 0,
                     }
+                }
+                if addr == 0x408 {
+                    let fake_time = (loop_count & 0xFFFFFFFF) as u32;
+                    data[0..4].copy_from_slice(&fake_time.to_le_bytes());
                 }
                 LoopAction::LogIoIn(addr)
             }
@@ -88,6 +92,14 @@ pub fn run(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> Result<(
                 let regs = vm.vcpu_fd.get_regs().ok();
                 let rip = regs.as_ref().map(|r| r.rip).unwrap_or(0);
                 let rflags = regs.as_ref().map(|r| r.rflags).unwrap_or(0);
+
+                // Progress Check
+                if rip == last_rip {
+                    hang_count += 1;
+                } else {
+                    last_rip = rip;
+                    hang_count = 0;
+                }
 
                 // [SPEED UP] 메모리 초기화 루프(memset 등) 구간은 로그 생략
                 if rip >= 0xfffff800005c4700 && rip <= 0xfffff800005c4800 {
@@ -145,15 +157,31 @@ pub fn run(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> Result<(
             let rflags = regs.as_ref().map(|r| r.rflags).unwrap_or(0);
             let cr8 = sregs.as_ref().map(|s| s.cr8).unwrap_or(0);
             
-           /** // [SHOCK TEST] 강제 인터럽트 주입 (20,000 루프 시점)
-            if loop_count == 20000 {
-                println!("\n[SHOCK TEST] Injecting forced Vector 0x30 to test kernel readiness...");
-                let mut vcpu_events = vm.vcpu_fd.get_vcpu_events().ok().unwrap_or_default();
-                vcpu_events.interrupt.injected = 1;
-                vcpu_events.interrupt.nr = 0x30; // Windows Timer Vector
-                vm.vcpu_fd.set_vcpu_events(&vcpu_events).ok();
+            // [HEARTBEAT] 주기적 타이머 인터럽트 주입 및 Tick Flag 강제 설정
+            if loop_count % 50000 == 0 {
+
+                let prcb_p = crate::LPB_PBASE + 0x10000 + 0x180;
+                // [CORE FIX] 커널 스케줄러를 깨우기 위해 PendingTickFlags(Offset 0x22)를 1로 설정
+                vm.write_memory((prcb_p + 0x22) as usize, &[1u8]).ok();
+                let kvm_run = vm.vcpu_fd.get_kvm_run();
+
+                if kvm_run.if_flag == 0 {
+                    println!("\n[FORCE] Kernel is in CLI loop. Injecting NMI to break and check TickFlags...");
+                    vm.vcpu_fd.nmi().ok();
+                } else {
+                    println!("\n[HEARTBEAT] Injecting Vector 0x30 (Timer) and setting PendingTickFlags=1...");
+                    let mut vcpu_events = vm.vcpu_fd.get_vcpu_events().ok().unwrap_or_default();
+                    vcpu_events.interrupt.injected = 1;
+                    vcpu_events.interrupt.nr = 0x30;
+                    vm.vcpu_fd.set_vcpu_events(&vcpu_events).ok();
+                }
             }
-            **/
+
+            if loop_count % 100000 == 0 {
+            let prcb_p = crate::LPB_PBASE + 0x10000 + 0x180;
+            // ReadySummary(0x520)에 비트 8(우선순위 8번)을 강제로 세움
+            vm.write_memory((prcb_p + 0x520) as usize, &0x00000100u32.to_le_bytes()).ok();
+            }
 
             // [NEW] KVM_RUN 구조체에서 인터럽트 윈도우 상태 직접 확인
             let kvm_run = vm.vcpu_fd.get_kvm_run();
@@ -211,7 +239,17 @@ fn setup_long_mode(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> 
     
     let mut cpuid = vm.kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)?;
     for entry in cpuid.as_mut_slice() {
-        if entry.function == 0x1 { entry.ecx &= !(1 << 31); }
+        if entry.function == 0x1 { 
+            entry.ecx &= !(1 << 31); // Hypervisor present = 0
+            entry.ecx &= !(1 << 21); // x2APIC = 0
+        }
+        // [NEW] CPUID Leaf 0x15: Core Crystal Clock Frequency (3.6GHz = 24MHz * 300 / 2)
+        if entry.function == 0x15 {
+            entry.eax = 2;           // Denominator
+            entry.ebx = 300;         // Numerator
+            entry.ecx = 24000000;    // Crystal Hz (24MHz)
+            entry.edx = 0;
+        }
         if entry.function == 0x40000000 { entry.ebx = 0; entry.ecx = 0; entry.edx = 0; }
         if entry.function == 0x80000001 { entry.edx |= 1 << 20; }
     }
@@ -248,9 +286,11 @@ fn setup_long_mode(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> 
 
     let mut sregs = vm.vcpu_fd.get_sregs()?;
     sregs.cr3 = gdt_pbase + 0x100000 + 0x2000;
-    sregs.cr4 = (1 << 5) | (1 << 9) | (1 << 10) | (1 << 16); 
+    // CR4: PAE(5), PGE(7), OSFXSR(9), OSXMMEXCPT(10), FSGSBASE(16)
+    sregs.cr4 = (1 << 5) | (1 << 7) | (1 << 9) | (1 << 10) | (1 << 16); 
     sregs.efer = (1 << 0) | (1 << 8) | (1 << 10) | (1 << 11); 
-    sregs.cr0 = (1 << 31) | (1 << 0) | (1 << 1) | (1 << 16) | (1 << 21) | (1 << 18);
+    // CR0: PE(0), MP(1), NE(5), WP(16), AM(18), PG(31)
+    sregs.cr0 = (1 << 31) | (1 << 0) | (1 << 1) | (1 << 5) | (1 << 16) | (1 << 18);
     
     sregs.gdt.base = gdt_vbase;
     sregs.gdt.limit = (32 * 8 - 1) as u16; // [RESTORED]

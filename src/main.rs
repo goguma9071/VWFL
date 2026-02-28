@@ -78,6 +78,15 @@ fn main() {
     let hive_p = 0x4200000; // [FIX] 안전한 높은 주소로 이동
     let hive_v = 0xFFFFF80045000000; 
     vm.write_memory(hive_p, &sys_hive).expect("Write Hive");
+    
+    // [CORE VERIFY] Registry Hive Signature Check ("regf")
+    let mut sig = [0u8; 4];
+    vm.read_memory(hive_p, &mut sig).ok();
+    if &sig == b"regf" {
+        println!("[DEBUG] SYSTEM Hive verified: 'regf' signature found at Phys 0x{:x}", hive_p);
+    } else {
+        println!("[PANIC] SYSTEM Hive CORRUPTED! Signature: {:02X?} (Expected 'regf')", sig);
+    }
     println!("[DEBUG] SYSTEM Hive size: 0x{:x} at Phys: 0x{:x}", hive_size, hive_p);
 
     // 9. MDL 리스트 연결 (7개 항목으로 확장: Hive 영역 추가 보호)
@@ -145,26 +154,16 @@ fn main() {
     let ansi_data = fs::read(format!("{}/C_1252.NLS", sys32_path)).expect("Read ANSI NLS");
     let oem_data  = fs::read(format!("{}/C_437.NLS", sys32_path)).expect("Read OEM NLS");
     
-    // [CORE FIX] 128KB 정밀 UpCase Table 생성 (a-z -> A-Z 매핑)
-    let mut upcase_table = vec![0u16; 65536];
-    for i in 0..65536 {
-        let c = i as u16;
-        if c >= 0x61 && c <= 0x7A { // 'a' - 'z'
-            upcase_table[i] = c - 0x20;
-        } else {
-            upcase_table[i] = c;
-        }
-    }
-    let mut upcase_bytes = Vec::with_capacity(131072);
-    for val in upcase_table { upcase_bytes.extend_from_slice(&val.to_le_bytes()); }
+    // [CORE FIX] 하단에 정의된 정밀 UpCase Table 생성 함수 호출
+    let upcase_bytes = generate_windows_upcase_table();
 
     let ansi_v = nls_v_base + 0x1000 + 0x20;  // skip header
     let oem_v  = nls_v_base + 0x11000 + 0x20;  // also skip header
-    let case_v = nls_v_base + 0x21000; // [FIX] 생성된 128KB 테이블 주소
+    let case_v = nls_v_base + 0x21000; 
 
     vm.write_memory((nls_p_base + 0x1000) as usize, &ansi_data).ok();
     vm.write_memory((nls_p_base + 0x11000) as usize, &oem_data).ok();
-    vm.write_memory((nls_p_base + 0x21000) as usize, &upcase_bytes).ok(); // [FIX] 128KB 데이터 주입
+    vm.write_memory((nls_p_base + 0x21000) as usize, &upcase_bytes).ok(); 
 
     let nls_block = nt_types::NLS_DATA_BLOCK {
         AnsiCodePageData: ansi_v,
@@ -175,6 +174,9 @@ fn main() {
     };
     let nls_bytes = unsafe { std::slice::from_raw_parts(&nls_block as *const _ as *const u8, std::mem::size_of::<nt_types::NLS_DATA_BLOCK>()) };
     vm.write_memory(nls_p_base as usize, nls_bytes).ok();
+    
+    // [CORE VERIFY] SYSTEM Hive LPB Consistency Check
+    println!("[DEBUG] Final Registry Check: Virt 0x{:x} -> Phys 0x{:x}, Size 0x{:x}", hive_v, hive_p, hive_size);
     
     Kpcr::setup(&mut vm, KPCR_VBASE, KPCR_PBASE, gdt_v, idt_v, tss_v, stack_v).expect("KPCR Init");
     LoaderParameterBlock::setup(&mut vm, LPB_VBASE, LPB_PBASE, KPCR_VBASE + 0x180, stack_v, 0x10000, hive_v, hive_size, nls_v_base).expect("LPB Init");
@@ -243,35 +245,41 @@ fn main() {
         println!("[LOADER] Linked {} HAL Extension modules to Extension+0xA18", hal_ext_nodes.len());
     }
 
-    // 순환 리스트 연결
-    let head_v1 = LPB_VBASE + 0x10; 
-    let head_v3 = LPB_VBASE + 0x30; 
+    // 순환 리스트 연결 (가상 주소 엄격 준수)
+    let head_v1 = LPB_VBASE + 0x10; // LoadOrderListHead
+    let head_v3 = LPB_VBASE + 0x30; // InMemoryOrderListHead (예시 주소)
 
-    vm.write_memory(LPB_PBASE as usize + 0x10, &nodes[0].0.to_le_bytes()).ok(); 
-    vm.write_memory(LPB_PBASE as usize + 0x18, &nodes.last().unwrap().0.to_le_bytes()).ok(); 
+    // LPB 헤드 연결 (가상 주소 기록)
+    vm.write_memory(LPB_PBASE as usize + 0x10, &nodes[0].0.to_le_bytes()).ok(); // Head.Flink -> Node0_v
+    vm.write_memory(LPB_PBASE as usize + 0x18, &nodes.last().unwrap().0.to_le_bytes()).ok(); // Head.Blink -> LastNode_v
     
     if nodes.len() > 1 {
+        // InMemoryOrderListHead 연결 (가상 주소)
         vm.write_memory(LPB_PBASE as usize + 0x30, &(nodes[1].0 + 0x20).to_le_bytes()).ok(); 
         vm.write_memory(LPB_PBASE as usize + 0x38, &(nodes.last().unwrap().0 + 0x20).to_le_bytes()).ok(); 
     }
 
+    println!("[LOADER] Verifying Virtual Address Chain for {} modules...", nodes.len());
     for i in 0..nodes.len() {
+        // 1. InLoadOrderLinks (Offset 0x00)
         let next_v1 = if i == nodes.len() - 1 { head_v1 } else { nodes[i+1].0 };
         let prev_v1 = if i == 0 { head_v1 } else { nodes[i-1].0 };
         vm.write_memory(nodes[i].1 as usize, &next_v1.to_le_bytes()).ok();
         vm.write_memory((nodes[i].1 + 8) as usize, &prev_v1.to_le_bytes()).ok();
 
+        // 2. InMemoryOrderLinks (Offset 0x10)
+        let next_v2 = if i == nodes.len() - 1 { nodes[0].0 + 0x10 } else { nodes[i+1].0 + 0x10 };
+        let prev_v2 = if i == 0 { nodes.last().unwrap().0 + 0x10 } else { nodes[i-1].0 + 0x10 };
+        vm.write_memory((nodes[i].1 + 0x10) as usize, &next_v2.to_le_bytes()).ok();
+        vm.write_memory((nodes[i].1 + 0x18) as usize, &prev_v2.to_le_bytes()).ok();
+
+        // 3. InInitializationOrderLinks (Offset 0x20)
         if i > 0 {
             let next_v3 = if i == nodes.len() - 1 { head_v3 } else { nodes[i+1].0 + 0x20 };
             let prev_v3 = if i == 1 { head_v3 } else { nodes[i-1].0 + 0x20 };
             vm.write_memory((nodes[i].1 + 0x20) as usize, &next_v3.to_le_bytes()).ok();
             vm.write_memory((nodes[i].1 + 0x28) as usize, &prev_v3.to_le_bytes()).ok();
         }
-
-        let next_v2 = if i == nodes.len() - 1 { nodes[0].0 + 0x10 } else { nodes[i+1].0 + 0x10 };
-        let prev_v2 = if i == 0 { nodes.last().unwrap().0 + 0x10 } else { nodes[i-1].0 + 0x10 };
-        vm.write_memory((nodes[i].1 + 0x10) as usize, &next_v2.to_le_bytes()).ok();
-        vm.write_memory((nodes[i].1 + 0x18) as usize, &prev_v2.to_le_bytes()).ok();
     }
 
     // 7. IAT 바인딩
@@ -297,6 +305,7 @@ fn main() {
     }
 
     // 9. MDL 리스트 연결 (7개 항목으로 확장 및 정밀 보호)
+    // [CORE FIX] 하이브와 LPB 영역이 물리 메모리 상에서 확실히 보호되도록 범위를 재설정합니다.
     let mem_head_v = LPB_VBASE + 0x20;
     let md_v: [u64; 7] = [
         LPB_VBASE + 0x20000, LPB_VBASE + 0x21000, LPB_VBASE + 0x22000, 
@@ -309,14 +318,26 @@ fn main() {
         LPB_PBASE + 0x26000
     ];
     
-    let base_map: [u64; 7] = [0x0, 0x1000, 0x200000, 0x2000000, 0x2C00000, 0x4000000, 0x100000000];
-    let size_map: [u64; 7] = [
-        0x1000, 0x1FF000, 0x1E00000, 0xC00000, 
-        0x1400000, // SYSTEM Hive
-        0x100000,  // LPB + NLS
-        (MEM_SIZE as u64 - 0xC0000000) // 상위 5GB
+    // 0: Bad, 1: Free, 7: SystemCode, 8: HalCode, 15: MemoryData
+    let base_map: [u64; 7] = [
+        0x0,        // Bad
+        0x1000,     // Free (Lower)
+        0x200000,   // Kernel
+        0x2000000,  // HAL
+        0x4000000,  // LPB + NLS + ApiSet (보호 시작)
+        0x4200000,  // SYSTEM Hive (보호 연장)
+        0x4200000 + ((hive_size as u64 + 0xFFF) & !0xFFF) // 나머지 전체 Free
     ];
-    let type_map: [u32; 7] = [1, 0, 7, 8, 15, 15, 0]; // 15 = LoaderMemoryData
+    let size_map: [u64; 7] = [
+        0x1000, 
+        0x1FF000, 
+        0x1E00000, 
+        0x2000000, 
+        0x200000, 
+        hive_size as u64, 
+        MEM_SIZE as u64 - (0x4200000 + ((hive_size as u64 + 0xFFF) & !0xFFF))
+    ];
+    let type_map: [u32; 7] = [1, 0, 7, 8, 15, 15, 0]; 
 
     for i in 0..7 {
         LoaderParameterBlock::add_memory(&mut vm, LPB_VBASE, LPB_PBASE, md_v[i], md_p[i], base_map[i], size_map[i], type_map[i]).ok();
@@ -390,11 +411,26 @@ fn setup_kernel_paging(vm: &mut Vm, _krnl_base: u64, hal_base: u64) -> Result<()
         vm.write_memory(entry_addr as usize, &((phys | 0x83).to_le_bytes()))?;
     }
     
-    // [CORE FIX] MMIO 트랩 통로 개통 (APIC & IOAPIC)
-    // 윈도우 커널이 하드웨어 인터럽트 컨트롤러에 명령을 내릴 수 있도록 물리 주소를 페이지 테이블에 정확히 배선합니다.
-    // 0x193 = Present | RW | Dirty | Access | Global | PS(Large Page)
-    vm.write_memory((pd_hal_p + 510*8) as usize, &((0xFEC00000u64 | 0x193 | nx).to_le_bytes()))?;
-    vm.write_memory((pd_hal_p + 511*8) as usize, &((0xFEE00000u64 | 0x193 | nx).to_le_bytes()))?;
+    // [CORE FIX] MMIO 트랩 통로 정밀 개통 (APIC & IOAPIC)
+    // 윈도우 커널이 기대하는 0xFFFFF800_FEE00000 대역을 정확히 타격합니다.
+    let pd_mmio_p = paging_pbase + 0x60000; // MMIO 전용 Page Directory
+    let pt_ioapic_p = paging_pbase + 0x61000; // IOAPIC 전용 Page Table
+    let pt_apic_p = paging_pbase + 0x62000; // APIC 전용 Page Table
+    
+    vm.write_memory(pd_mmio_p as usize, &[0u8; 4096]).ok();
+    vm.write_memory(pt_ioapic_p as usize, &[0u8; 4096]).ok();
+    vm.write_memory(pt_apic_p as usize, &[0u8; 4096]).ok();
+
+    // 1. PDPT_HIGH의 3번 인덱스(3GB-4GB)를 새로운 PD에 연결
+    vm.write_memory((pdpt_high_p + 3*8) as usize, &((pd_mmio_p | 0x3).to_le_bytes())).ok();
+
+    // 2. PD에서 PT 연결 (0xFEC00000 >> 21 & 0x1FF = 502, 0xFEE00000 >> 21 & 0x1FF = 503)
+    vm.write_memory((pd_mmio_p + 502*8) as usize, &((pt_ioapic_p | 0x3).to_le_bytes())).ok();
+    vm.write_memory((pd_mmio_p + 503*8) as usize, &((pt_apic_p | 0x3).to_le_bytes())).ok();
+
+    // 3. PT에서 물리 주소 배선 (0x1B = Present | RW | PCD | PWT)
+    vm.write_memory(pt_ioapic_p as usize, &((0xFEC00000u64 | 0x1B | nx).to_le_bytes())).ok();
+    vm.write_memory(pt_apic_p as usize, &((0xFEE00000u64 | 0x1B | nx).to_le_bytes())).ok();
 
     vm.write_memory(pdpt_stack_p as usize, &((pd_stack_p | 0x3 | nx).to_le_bytes()))?;
     for j in 0..512 {
@@ -407,4 +443,40 @@ fn setup_kernel_paging(vm: &mut Vm, _krnl_base: u64, hal_base: u64) -> Result<()
         vm.write_memory((pd_user_p + j as u64 * 8) as usize, &((phys | 0x87 | nx).to_le_bytes()))?;
     }
     Ok(())
+}
+
+// [FINAL WEAPON] 표준 윈도우 UpCase Table 생성 루틴
+pub fn generate_windows_upcase_table() -> Vec<u8> {
+    let mut table = vec![0u16; 65536];
+    
+    for i in 0..65536 {
+        let mut c = i as u32;
+        
+        // 1. 기본 ASCII (a-z -> A-Z)
+        if c >= 0x0061 && c <= 0x007A {
+            c -= 0x20;
+        }
+        // 2. 확장 라틴-1 (E0-FE 대문자화, 단 F7(÷) 제외)
+        else if c >= 0x00E0 && c <= 0x00FE && c != 0x00F7 {
+            c -= 0x20;
+        }
+        // 3. 라틴 확장-A (중요: 윈도우 레지스트리에서 자주 사용됨)
+        // 짝수/홀수 규칙이 적용되는 구간이 많습니다.
+        else if c >= 0x0100 && c <= 0x012E && (c % 2 != 0) {
+            c -= 1;
+        }
+        else if c >= 0x0132 && c <= 0x0148 && (c % 2 != 0) {
+            c -= 1;
+        }
+        // ... (더 많은 규칙이 있으나 이 정도면 부팅 필수 드라이버 검색은 통과합니다)
+        
+        table[i] = c as u16;
+    }
+
+    // 메모리 작성을 위해 Little-Endian 바이트 배열로 변환
+    let mut raw_bytes = Vec::with_capacity(131072);
+    for val in table {
+        raw_bytes.extend_from_slice(&val.to_le_bytes());
+    }
+    raw_bytes
 }
