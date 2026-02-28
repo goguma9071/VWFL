@@ -49,11 +49,22 @@ pub fn setup(vm: &mut Vm, base_paddr: u64, base_vaddr: u64) -> Result<u64, &'sta
     vm.write_memory(madt_p as usize, &madt)?;
 
     // 3. FADT
-    let mut fadt = vec![0u8; 244];
-    write_header(&mut fadt, b"FACP", 244, 3);
-    fadt[109] = 0x3; 
-    fadt[112..116].copy_from_slice(&0x00000401u32.to_le_bytes()); 
-    fadt[140..148].copy_from_slice(&dsdt_v.to_le_bytes()); 
+    let mut fadt = vec![0u8; 276];
+    write_header(&mut fadt, b"FACP", 276, 3);
+    fadt[40..44].copy_from_slice(&(dsdt_v as u32).to_le_bytes());
+    fadt[45] = 1;
+    fadt[76..80].copy_from_slice(&0x408u32.to_le_bytes());
+    fadt[91] = 4;
+
+    fadt[109..111].copy_from_slice(&3u16.to_le_bytes()); 
+    fadt[112..116].copy_from_slice(&0x00000100u32.to_le_bytes()); 
+    fadt[140..148].copy_from_slice(&dsdt_v.to_le_bytes());
+
+    fadt[208] = 1;
+    fadt[209] = 32;
+    fadt[210] = 0;
+    fadt[211] = 3;
+    fadt[212..220].copy_from_slice(&0x408u64.to_le_bytes());
     update_checksum(&mut fadt);
     vm.write_memory(fadt_p as usize, &fadt)?;
 
