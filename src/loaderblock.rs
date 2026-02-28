@@ -98,7 +98,7 @@ pub struct KPROCESSOR_STATE {
     pub ContextFrame: [UCHAR; 0x4d0],
 }
 
-/// _KPRCB (Kernel Processor Control Block) - Build 19041 x64 정밀 오프셋
+/// _KPRCB (Kernel Processor Control Block) - 최신 Windows 10 명세 반영 (sizeof 0x700)
 #[repr(C, align(64))]
 pub struct KPRCB {
     pub MxCsr: ULONG,                                   // 0x0
@@ -117,22 +117,36 @@ pub struct KPRCB {
     pub RspBase: ULONGLONG,                             // 0x28
     pub PrcbLock: ULONGLONG,                            // 0x30
     pub PriorityState: PVOID,                           // 0x38
-    pub CurrentProcess: PVOID,                          // 0x40
-    pub CpuType: UCHAR,                                 // 0x48
-    pub CpuID: UCHAR,                                   // 0x49
-    pub CpuStep: USHORT,                                // 0x4a
-    pub MHz: ULONG,                                     // 0x4c
-    pub HalReserved: [ULONGLONG; 7],                    // 0x50 -> 0x88
+    
+    pub CpuType: UCHAR,                                 // 0x40
+    pub CpuID: UCHAR,                                   // 0x41
+    pub CpuStep: USHORT,                                // 0x42
+    pub MHz: ULONG,                                     // 0x44
+    pub HalReserved: [ULONGLONG; 8],                    // 0x48 -> 0x88
     
     pub MinorVersion: USHORT,                           // 0x88
     pub MajorVersion: USHORT,                           // 0x8a
-    pub BuildType: USHORT,                              // 0x8c
-    pub CpuVendor: UCHAR,                               // 0x8e
-    pub CoresPerProcessor: UCHAR,                       // 0x8f
+    pub BuildType: UCHAR,                               // 0x8c
+    pub CpuVendor: UCHAR,                               // 0x8d
+    pub LegacyCoresPerPhysicalProcessor: UCHAR,         // 0x8e
+    pub LegacyLogicalProcessorsPerCore: UCHAR,          // 0x8f
     pub TscFrequency: ULONGLONG,                        // 0x90
     
-    pub PrcbPad: [ULONGLONG; 6],                        // 0x98 -> 0xC8
-    pub Reserved2: [UCHAR; 56],                         // 0x100까지 패딩
+    pub CoresPerPhysicalProcessor: ULONG,               // 0x98
+    pub LogicalProcessorsPerCore: ULONG,                // 0x9c
+    pub PrcbPad04: [ULONGLONG; 4],                      // 0xa0
+    pub ParentNode: PVOID,                              // 0xc0
+    pub GroupSetMember: ULONGLONG,                      // 0xc8
+    pub Group: UCHAR,                                   // 0xd0
+    pub GroupIndex: UCHAR,                              // 0xd1
+    pub PrcbPad05: [UCHAR; 2],                          // 0xd2
+    pub InitialApicId: ULONG,                           // 0xd4
+    pub ScbOffset: ULONG,                               // 0xd8
+    pub ApicMask: ULONG,                                // 0xdc
+    pub AcpiReserved: PVOID,                            // 0xe0
+    pub CFlushSize: ULONG,                              // 0xe8
+    pub PrcbPad11: [ULONGLONG; 2],                      // 0xf0
+    
     pub ProcessorState: KPROCESSOR_STATE,               // 0x100
 }
 
@@ -179,8 +193,7 @@ impl Kpcr {
         prcb.NextThread = dummy_thread_v;
         prcb.IdleThread = dummy_thread_v;
         prcb.RspBase = stack_v;
-        prcb.CurrentProcess = dummy_process_v;
-        prcb.MinorVersion = 19041;
+        prcb.MinorVersion = 19045;
         prcb.MajorVersion = 10;
         prcb.TscFrequency = 3600000000; 
         prcb.MHz = 3600;

@@ -221,6 +221,7 @@ fn main() {
     println!("------------------------------------\n");
 
     // [CORE FIX] HalExtensionModuleList (Extension + 0xA18) 연결
+    // 커널은 리스트 헤드가 각 노드의 InInitializationOrderLinks (Offset 0x20)를 가리키기를 기대합니다.
     let hal_ext_head_v = ext_v + 0xA18;
     let hal_ext_head_p = ext_p + 0xA18;
     let mut hal_ext_nodes = Vec::new();
@@ -232,32 +233,31 @@ fn main() {
     }
 
     if !hal_ext_nodes.is_empty() {
-        vm.write_memory(hal_ext_head_p as usize, &hal_ext_nodes[0].0.to_le_bytes()).ok();
-        vm.write_memory((hal_ext_head_p + 8) as usize, &hal_ext_nodes.last().unwrap().0.to_le_bytes()).ok();
+        let first_entry_v = hal_ext_nodes[0].0 + 0x20;
+        let last_entry_v = hal_ext_nodes.last().unwrap().0 + 0x20;
+        vm.write_memory(hal_ext_head_p as usize, &first_entry_v.to_le_bytes()).ok();
+        vm.write_memory((hal_ext_head_p + 8) as usize, &last_entry_v.to_le_bytes()).ok();
 
         for i in 0..hal_ext_nodes.len() {
-            let next_v = if i == hal_ext_nodes.len() - 1 { hal_ext_head_v } else { hal_ext_nodes[i+1].0 };
-            let prev_v = if i == 0 { hal_ext_head_v } else { hal_ext_nodes[i-1].0 };
-            let node_p = hal_ext_nodes[i].1;
-            vm.write_memory((node_p + 0x20) as usize, &next_v.to_le_bytes()).ok();
-            vm.write_memory((node_p + 0x28) as usize, &prev_v.to_le_bytes()).ok();
+            let node_v_entry = hal_ext_nodes[i].0 + 0x20;
+            let node_p_entry = hal_ext_nodes[i].1 + 0x20;
+            let next_v = if i == hal_ext_nodes.len() - 1 { hal_ext_head_v } else { hal_ext_nodes[i+1].0 + 0x20 };
+            let prev_v = if i == 0 { hal_ext_head_v } else { hal_ext_nodes[i-1].0 + 0x20 };
+            vm.write_memory(node_p_entry as usize, &next_v.to_le_bytes()).ok();
+            vm.write_memory((node_p_entry + 8) as usize, &prev_v.to_le_bytes()).ok();
         }
         println!("[LOADER] Linked {} HAL Extension modules to Extension+0xA18", hal_ext_nodes.len());
     }
 
-    // 순환 리스트 연결 (가상 주소 엄격 준수)
-    let head_v1 = LPB_VBASE + 0x10; // LoadOrderListHead
-    let head_v3 = LPB_VBASE + 0x30; // InMemoryOrderListHead (예시 주소)
-
-    // LPB 헤드 연결 (가상 주소 기록)
-    vm.write_memory(LPB_PBASE as usize + 0x10, &nodes[0].0.to_le_bytes()).ok(); // Head.Flink -> Node0_v
-    vm.write_memory(LPB_PBASE as usize + 0x18, &nodes.last().unwrap().0.to_le_bytes()).ok(); // Head.Blink -> LastNode_v
+    // [CORE FIX] LPB.LoadOrderListHead (0x10) 연결
+    let head_v1 = LPB_VBASE + 0x10;
+    vm.write_memory(LPB_PBASE as usize + 0x10, &nodes[0].0.to_le_bytes()).ok(); 
+    vm.write_memory(LPB_PBASE as usize + 0x18, &nodes.last().unwrap().0.to_le_bytes()).ok(); 
     
-    if nodes.len() > 1 {
-        // InMemoryOrderListHead 연결 (가상 주소)
-        vm.write_memory(LPB_PBASE as usize + 0x30, &(nodes[1].0 + 0x20).to_le_bytes()).ok(); 
-        vm.write_memory(LPB_PBASE as usize + 0x38, &(nodes.last().unwrap().0 + 0x20).to_le_bytes()).ok(); 
-    }
+    // [CORE FIX] BootDriverListHead (0x30) 초기화 (비어있는 리스트로 자기 참조)
+    let boot_ldr_head_v = LPB_VBASE + 0x30;
+    vm.write_memory(LPB_PBASE as usize + 0x30, &boot_ldr_head_v.to_le_bytes()).ok();
+    vm.write_memory(LPB_PBASE as usize + 0x38, &boot_ldr_head_v.to_le_bytes()).ok();
 
     println!("[LOADER] Verifying Virtual Address Chain for {} modules...", nodes.len());
     for i in 0..nodes.len() {
@@ -272,14 +272,6 @@ fn main() {
         let prev_v2 = if i == 0 { nodes.last().unwrap().0 + 0x10 } else { nodes[i-1].0 + 0x10 };
         vm.write_memory((nodes[i].1 + 0x10) as usize, &next_v2.to_le_bytes()).ok();
         vm.write_memory((nodes[i].1 + 0x18) as usize, &prev_v2.to_le_bytes()).ok();
-
-        // 3. InInitializationOrderLinks (Offset 0x20)
-        if i > 0 {
-            let next_v3 = if i == nodes.len() - 1 { head_v3 } else { nodes[i+1].0 + 0x20 };
-            let prev_v3 = if i == 1 { head_v3 } else { nodes[i-1].0 + 0x20 };
-            vm.write_memory((nodes[i].1 + 0x20) as usize, &next_v3.to_le_bytes()).ok();
-            vm.write_memory((nodes[i].1 + 0x28) as usize, &prev_v3.to_le_bytes()).ok();
-        }
     }
 
     // 7. IAT 바인딩
@@ -292,64 +284,18 @@ fn main() {
     let mut gdt_entries = vec![0u64; 32];
     gdt_entries[2] = 0x00AF9A000000FFFF;
     gdt_entries[3] = 0x00CF92000000FFFF;
-    // [RESTORE] User mode GDT entries
     gdt_entries[4] = 0x00AFFA000000FFFF;
     gdt_entries[5] = 0x00CFF2000000FFFF;
     gdt_entries[6] = 0x00AFFA000000FFFF;
 
-    let tss_low = (0x00 << 56) | (0x00 << 52) | (0x89 << 40) | ((tss_p & 0xFFFFFF) << 16) | (0x67);
-    let tss_high = tss_p >> 32;
+    // [CORE FIX] TSS 주소를 가상 주소로 변환하여 기록
+    let tss_v_gdt: u64 = gdt_v + 0x1000;
+    let tss_low = (0x00 << 56) | (0x00 << 52) | (0x89 << 40) | ((tss_v_gdt & 0xFFFFFF) << 16) | (0x67);
+    let tss_high = tss_v_gdt >> 32;
     gdt_entries[8] = tss_low; gdt_entries[9] = tss_high;
     for (i, entry) in gdt_entries.iter().enumerate() {
         vm.write_memory((SYSTEM_BASE + i as u64 * 8) as usize, &entry.to_le_bytes()).ok();
     }
-
-    // 9. MDL 리스트 연결 (7개 항목으로 확장 및 정밀 보호)
-    // [CORE FIX] 하이브와 LPB 영역이 물리 메모리 상에서 확실히 보호되도록 범위를 재설정합니다.
-    let mem_head_v = LPB_VBASE + 0x20;
-    let md_v: [u64; 7] = [
-        LPB_VBASE + 0x20000, LPB_VBASE + 0x21000, LPB_VBASE + 0x22000, 
-        LPB_VBASE + 0x23000, LPB_VBASE + 0x24000, LPB_VBASE + 0x25000,
-        LPB_VBASE + 0x26000
-    ];
-    let md_p: [u64; 7] = [
-        LPB_PBASE + 0x20000, LPB_PBASE + 0x21000, LPB_PBASE + 0x22000, 
-        LPB_PBASE + 0x23000, LPB_PBASE + 0x24000, LPB_PBASE + 0x25000,
-        LPB_PBASE + 0x26000
-    ];
-    
-    // 0: Bad, 1: Free, 7: SystemCode, 8: HalCode, 15: MemoryData
-    let base_map: [u64; 7] = [
-        0x0,        // Bad
-        0x1000,     // Free (Lower)
-        0x200000,   // Kernel
-        0x2000000,  // HAL
-        0x4000000,  // LPB + NLS + ApiSet (보호 시작)
-        0x4200000,  // SYSTEM Hive (보호 연장)
-        0x4200000 + ((hive_size as u64 + 0xFFF) & !0xFFF) // 나머지 전체 Free
-    ];
-    let size_map: [u64; 7] = [
-        0x1000, 
-        0x1FF000, 
-        0x1E00000, 
-        0x2000000, 
-        0x200000, 
-        hive_size as u64, 
-        MEM_SIZE as u64 - (0x4200000 + ((hive_size as u64 + 0xFFF) & !0xFFF))
-    ];
-    let type_map: [u32; 7] = [1, 0, 7, 8, 15, 15, 0]; 
-
-    for i in 0..7 {
-        LoaderParameterBlock::add_memory(&mut vm, LPB_VBASE, LPB_PBASE, md_v[i], md_p[i], base_map[i], size_map[i], type_map[i]).ok();
-        
-        let n_v = if i == 6 { mem_head_v } else { md_v[i+1] };
-        let p_v = if i == 0 { mem_head_v } else { md_v[i-1] };
-        vm.write_memory(md_p[i] as usize, &n_v.to_le_bytes()).ok();
-        vm.write_memory((md_p[i] + 8) as usize, &p_v.to_le_bytes()).ok();
-    }
-    // LPB Head 연결
-    vm.write_memory(LPB_PBASE as usize + 0x20, &md_v[0].to_le_bytes()).ok(); 
-    vm.write_memory(LPB_PBASE as usize + 0x28, &md_v[6].to_le_bytes()).ok(); 
 
     debug::setup_diagnostic_idt(&mut vm).expect("IDT failed");
 

@@ -9,7 +9,7 @@ pub fn run(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> Result<(
     println!("[CPU] Initializing vCPU state...");
     setup_long_mode(vm, krnl_entry_v, stack_v, lpb_v)?;
 
-    let k = true; // true: 디버그 모드 (느림), false: 고속 모드 (빠름)
+    let k = false; // true: 디버그 모드 (느림), false: 고속 모드 (빠름)
     let debug_control = if k { 0x00000001 | 0x00000002 } else { 0x00000001 };
     vm.vcpu_fd.set_guest_debug(&kvm_bindings::kvm_guest_debug {
         control: debug_control,
@@ -62,17 +62,31 @@ pub fn run(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> Result<(
                 }
                 LoopAction::LogIoIn(addr)
             }
-            VcpuExit::MmioRead(addr, _data) => {
-                if addr >= 0xfee00000 && addr <= 0xfee00fff {
-                    LoopAction::LogApic(addr, 0, false)
+            VcpuExit::MmioRead(addr, data) => {
+                let mut val = 0u32;
+                let action = if addr >= 0xfee00000 && addr <= 0xfee00fff {
+                    val = match addr & 0xFFF {
+                        0x20 => 0x0,      // APIC ID
+                        0x30 => 0x50014,  // APIC Version (Standard)
+                        0xF0 => 0x1FF,    // Spurious Vector (Enabled)
+                        _ => 0,
+                    };
+                    LoopAction::LogApic(addr, val, false)
                 } else if addr >= 0xfec00000 && addr <= 0xfec00fff {
                     LoopAction::LogIoApic(addr, 0, false)
                 } else {
                     LoopAction::LogMmioRead(addr)
-                }
+                };
+                
+                // [CORE FIX] 게스트 버퍼에 읽은 값 복사
+                let bytes = val.to_le_bytes();
+                let len = data.len().min(4);
+                data[..len].copy_from_slice(&bytes[..len]);
+                action
             }
             VcpuExit::MmioWrite(addr, data) => {
-                let val = if data.len() >= 4 { u32::from_le_bytes(data[0..4].try_into().unwrap()) } else { 0 };
+                let val = if data.len() >= 4 { u32::from_le_bytes(data[0..4].try_into().unwrap()) } 
+                          else if data.len() >= 1 { data[0] as u32 } else { 0 };
                 if addr >= 0xfee00000 && addr <= 0xfee00fff {
                     LoopAction::LogApic(addr, val, true)
                 } else if addr >= 0xfec00000 && addr <= 0xfec00fff {
