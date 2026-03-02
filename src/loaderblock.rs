@@ -38,67 +38,90 @@ pub struct MEMORY_ALLOCATION_DESCRIPTOR {
     pub BasePage: ULONGLONG,
     pub PageCount: ULONGLONG,
 }
+
+/// _KLDR_DATA_TABLE_ENTRY - 최신 Windows 10 명세 반영 (0x120 bytes)
 #[repr(C)]
 pub struct LDR_DATA_TABLE_ENTRY {
-    pub InLoadOrderLinks: LIST_ENTRY,
-    pub InMemoryOrderLinks: LIST_ENTRY,
-    pub InInitializationOrderLinks: LIST_ENTRY,
-    pub DllBase: PVOID,
-    pub EntryPoint: PVOID,
-    pub SizeOfImage: ULONG,
-    pub CheckSum: ULONG,
-    pub FullDllName: UNICODE_STRING,
-    pub BaseDllName: UNICODE_STRING,
-    pub Flags: ULONG,
-    pub ObsoleteLoadCount: USHORT,
-    pub TlsIndex: USHORT,
-    pub HashLinks: LIST_ENTRY,
-    pub TimeDateStamp: ULONG,
-    pub EntryPointActivationContext: PVOID,
-    pub Lock: PVOID,
-    pub DdagNode: PVOID,
-    pub NodeModuleLink: LIST_ENTRY,
-    pub LoadContext: PVOID,
-    pub ParentDllBase: PVOID,
+    pub InLoadOrderLinks: LIST_ENTRY,                    // 0x0
+    pub InMemoryOrderLinks: LIST_ENTRY,                  // 0x10
+    pub InInitializationOrderLinks: LIST_ENTRY,          // 0x20
+    pub DllBase: PVOID,                                  // 0x30
+    pub EntryPoint: PVOID,                               // 0x38
+    pub SizeOfImage: ULONG,                              // 0x40
+    pub Padding_After_Size: ULONG,                       // 0x44
+    pub FullDllName: UNICODE_STRING,                     // 0x48
+    pub BaseDllName: UNICODE_STRING,                     // 0x58
+    pub Flags: ULONG,                                    // 0x68
+    pub ObsoleteLoadCount: USHORT,                       // 0x6c
+    pub TlsIndex: USHORT,                                // 0x6e
+    pub HashLinks: LIST_ENTRY,                           // 0x70
+    pub TimeDateStamp: ULONG,                            // 0x80
+    pub Padding_After_Time: ULONG,                       // 0x84
+    pub EntryPointActivationContext: PVOID,              // 0x88
+    pub Lock: PVOID,                                     // 0x90
+    pub DdagNode: PVOID,                                 // 0x98
+    pub NodeModuleLink: LIST_ENTRY,                      // 0xa0
+    pub LoadContext: PVOID,                              // 0xb0
+    pub ParentDllBase: PVOID,                            // 0xb8
+    pub SwitchBackContext: PVOID,                        // 0xc0
+    pub BaseAddressIndexNode: [UCHAR; 24],               // 0xc8
+    pub MappingInfoIndexNode: [UCHAR; 24],               // 0xe0
+    pub OriginalBase: ULONGLONG,                         // 0xf8
+    pub LoadTime: ULONGLONG,                             // 0x100
+    pub BaseNameHashValue: ULONG,                        // 0x108
+    pub LoadReason: ULONG,                               // 0x10c
+    pub ImplicitPathOptions: ULONG,                      // 0x110
+    pub ReferenceCount: ULONG,                           // 0x114
+    pub DependentLoadFlags: ULONG,                       // 0x118
+    pub SigningLevel: UCHAR,                             // 0x11c
+    pub Padding_Final: [UCHAR; 3],                       // 0x11d -> 0x120
 }
 
-/// _KSPECIAL_REGISTERS - 19041 x64
+/// _KSPECIAL_REGISTERS - 베르길리우스 명세 반영 (0xf0 bytes)
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct KSPECIAL_REGISTERS {
-    pub Cr0: ULONGLONG,
-    pub Cr2: ULONGLONG,
-    pub Cr3: ULONGLONG,
-    pub Cr4: ULONGLONG,
-    pub KernelDr0: ULONGLONG,
-    pub KernelDr1: ULONGLONG,
-    pub KernelDr2: ULONGLONG,
-    pub KernelDr3: ULONGLONG,
-    pub KernelDr6: ULONGLONG,
-    pub KernelDr7: ULONGLONG,
-    pub Gdtr: [u8; 16], 
-    pub Idtr: [u8; 16],
-    pub Tr: USHORT,
-    pub Ldtr: USHORT,
-    pub MxCsr: ULONG,
-    pub DebugControl: ULONGLONG,
-    pub LastBranchToRip: ULONGLONG,
-    pub LastBranchFromRip: ULONGLONG,
-    pub LastExceptionToRip: ULONGLONG,
-    pub LastExceptionFromRip: ULONGLONG,
-    pub Cr8: ULONGLONG,
-    pub XCr0: ULONGLONG,
+    pub Cr0: ULONGLONG,                                 // 0x0
+    pub Cr2: ULONGLONG,                                 // 0x8
+    pub Cr3: ULONGLONG,                                 // 0x10
+    pub Cr4: ULONGLONG,                                 // 0x18
+    pub KernelDr0: ULONGLONG,                           // 0x20
+    pub KernelDr1: ULONGLONG,                           // 0x28
+    pub KernelDr2: ULONGLONG,                           // 0x30
+    pub KernelDr3: ULONGLONG,                           // 0x38
+    pub KernelDr6: ULONGLONG,                           // 0x40
+    pub KernelDr7: ULONGLONG,                           // 0x48
+    pub Gdtr: [UCHAR; 16],                              // 0x50 (KDESCRIPTOR)
+    pub Idtr: [UCHAR; 16],                              // 0x60 (KDESCRIPTOR)
+    pub Tr: USHORT,                                     // 0x70
+    pub Ldtr: USHORT,                                   // 0x72
+    pub MxCsr: ULONG,                                   // 0x74
+    pub DebugControl: ULONGLONG,                        // 0x78
+    pub LastBranchToRip: ULONGLONG,                     // 0x80
+    pub LastBranchFromRip: ULONGLONG,                   // 0x88
+    pub LastExceptionToRip: ULONGLONG,                  // 0x90
+    pub LastExceptionFromRip: ULONGLONG,                // 0x98
+    pub Cr8: ULONGLONG,                                 // 0xa0
+    pub MsrGsBase: ULONGLONG,                           // 0xa8
+    pub MsrGsSwap: ULONGLONG,                           // 0xb0
+    pub MsrStar: ULONGLONG,                             // 0xb8
+    pub MsrLStar: ULONGLONG,                            // 0xc0
+    pub MsrCStar: ULONGLONG,                            // 0xc8
+    pub MsrSyscallMask: ULONGLONG,                      // 0xd0
+    pub Xcr0: ULONGLONG,                                // 0xd8
+    pub MsrFsBase: ULONGLONG,                           // 0xe0
+    pub SpecialPadding0: ULONGLONG,                     // 0xe8 -> 0xf0
 }
 
-/// _KPROCESSOR_STATE
+/// _KPROCESSOR_STATE (0x5c0 bytes)
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct KPROCESSOR_STATE {
-    pub SpecialRegisters: KSPECIAL_REGISTERS,
-    pub ContextFrame: [UCHAR; 0x4d0],
+    pub SpecialRegisters: KSPECIAL_REGISTERS,           // 0x0 (0xf0 bytes)
+    pub ContextFrame: [UCHAR; 0x4d0],                   // 0xf0 (CONTEXT)
 }
 
-/// _KPRCB (Kernel Processor Control Block) - 최신 Windows 10 명세 반영 (sizeof 0x700)
+/// _KPRCB (Kernel Processor Control Block) - 0x700 bytes
 #[repr(C, align(64))]
 pub struct KPRCB {
     pub MxCsr: ULONG,                                   // 0x0
@@ -117,13 +140,11 @@ pub struct KPRCB {
     pub RspBase: ULONGLONG,                             // 0x28
     pub PrcbLock: ULONGLONG,                            // 0x30
     pub PriorityState: PVOID,                           // 0x38
-    
     pub CpuType: UCHAR,                                 // 0x40
     pub CpuID: UCHAR,                                   // 0x41
     pub CpuStep: USHORT,                                // 0x42
     pub MHz: ULONG,                                     // 0x44
-    pub HalReserved: [ULONGLONG; 8],                    // 0x48 -> 0x88
-    
+    pub HalReserved: [ULONGLONG; 8],                    // 0x48
     pub MinorVersion: USHORT,                           // 0x88
     pub MajorVersion: USHORT,                           // 0x8a
     pub BuildType: UCHAR,                               // 0x8c
@@ -131,7 +152,6 @@ pub struct KPRCB {
     pub LegacyCoresPerPhysicalProcessor: UCHAR,         // 0x8e
     pub LegacyLogicalProcessorsPerCore: UCHAR,          // 0x8f
     pub TscFrequency: ULONGLONG,                        // 0x90
-    
     pub CoresPerPhysicalProcessor: ULONG,               // 0x98
     pub LogicalProcessorsPerCore: ULONG,                // 0x9c
     pub PrcbPad04: [ULONGLONG; 4],                      // 0xa0
@@ -146,11 +166,15 @@ pub struct KPRCB {
     pub AcpiReserved: PVOID,                            // 0xe0
     pub CFlushSize: ULONG,                              // 0xe8
     pub PrcbPad11: [ULONGLONG; 2],                      // 0xf0
-    
-    pub ProcessorState: KPROCESSOR_STATE,               // 0x100
+    pub ProcessorState: KPROCESSOR_STATE,               // 0x100 (0x5c0 bytes)
+    pub ExtendedSupervisorState: PVOID,                 // 0x6c0
+    pub ProcessorSignature: ULONG,                      // 0x6c8
+    pub ProcessorFlags: ULONG,                          // 0x6cc
+    pub PrcbPad12a: ULONGLONG,                          // 0x6d0
+    pub PrcbPad12: [ULONGLONG; 3],                      // 0x6d8 -> 0x700
 }
 
-/// _KPCR (Kernel Processor Control Region) - 0x180 bytes
+/// _KPCR (Kernel Processor Control Region) - 0x178 bytes
 #[repr(C, align(16))]
 pub struct KPCR {
     pub GdtBase: PVOID,                                 // 0x0
@@ -161,147 +185,100 @@ pub struct KPCR {
     pub LockArray: PVOID,                               // 0x28
     pub Used_Self: PVOID,                               // 0x30
     pub IdtBase: PVOID,                                 // 0x38
-    pub Unused: [ULONGLONG; 2],                         // 0x40 -> 0x50
+    pub Unused: [ULONGLONG; 2],                         // 0x40
     pub Irql: UCHAR,                                    // 0x50
-    pub Unused2: [UCHAR; 19],                           // 0x51 -> 0x64
-    pub StallScaleFactor: ULONG,                        // 0x64 (CRITICAL for timing)
-    pub Padding: [UCHAR; 160],                          // 0x68 -> 0x108
+    pub SecondLevelCacheAssociativity: UCHAR,           // 0x51
+    pub ObsoleteNumber: UCHAR,                          // 0x52
+    pub Fill0: UCHAR,                                   // 0x53
+    pub Unused0: [ULONG; 3],                            // 0x54
+    pub MajorVersion: USHORT,                           // 0x60
+    pub MinorVersion: USHORT,                           // 0x62
+    pub StallScaleFactor: ULONG,                        // 0x64
+    pub Unused1: [PVOID; 3],                            // 0x68
+    pub KernelReserved: [ULONG; 15],                    // 0x80
+    pub SecondLevelCacheSize: ULONG,                    // 0xbc
+    pub HalReserved: [ULONG; 16],                       // 0xc0
+    pub Unused2: ULONG,                                 // 0x100
+    pub Padding_Align: ULONG,                           // 0x104
     pub KdVersionBlock: PVOID,                          // 0x108
-    pub Reserved: [ULONGLONG; 14],                      // 0x110 -> 0x180
+    pub Unused3: PVOID,                                 // 0x110
+    pub PcrAlign1: [ULONG; 24],                         // 0x118
 }
 
 pub struct Kpcr;
 impl Kpcr {
     pub fn setup(vm: &mut Vm, vaddr: u64, paddr: u64, gdt_v: u64, idt_v: u64, tss_v: u64, stack_v: u64) -> Result<(), &'static str> {
         let mut kpcr = unsafe { std::mem::zeroed::<KPCR>() };
-        let mut prcb = unsafe { std::mem::zeroed::<KPRCB>() };
-        
-        let prcb_v = vaddr + 0x180;
-        let dummy_thread_v = vaddr + 0x5000;
-        let dummy_process_v = vaddr + 0x6000;
-
         kpcr.GdtBase = gdt_v;
         kpcr.TssBase = tss_v;
         kpcr.SelfPcr = vaddr;
-        kpcr.CurrentPrcb = prcb_v;
+        kpcr.CurrentPrcb = vaddr + 0x180;
         kpcr.Used_Self = vaddr;
         kpcr.IdtBase = idt_v;
-        kpcr.StallScaleFactor = 0x00000024; // 3.6GHz (3600MHz / 100) Scale Factor
+        kpcr.MajorVersion = 1;
+        kpcr.MinorVersion = 1;
+        kpcr.StallScaleFactor = 0x00000024;
 
+        let mut prcb = unsafe { std::mem::zeroed::<KPRCB>() };
         prcb.MxCsr = 0x1F80;
-        prcb.CurrentThread = dummy_thread_v;
-        prcb.NextThread = dummy_thread_v;
-        prcb.IdleThread = dummy_thread_v;
         prcb.RspBase = stack_v;
-        prcb.MinorVersion = 19045;
+        prcb.MinorVersion = 19041;
         prcb.MajorVersion = 10;
-        prcb.TscFrequency = 3600000000; 
+        prcb.TscFrequency = 3600000000;
         prcb.MHz = 3600;
-
-        let cr3 = 0x8102000; 
-        prcb.ProcessorState.SpecialRegisters.Cr3 = cr3;
+        prcb.ProcessorState.SpecialRegisters.Cr3 = 0x8102000;
         prcb.ProcessorState.SpecialRegisters.Cr0 = 0x80050033;
         prcb.ProcessorState.SpecialRegisters.Cr4 = 0x6f8;
-        prcb.ProcessorState.SpecialRegisters.MxCsr = 0x1F80;
-        prcb.ProcessorState.SpecialRegisters.Tr = 0x40;
-
-        let gdt_limit: u16 = (32 * 8 - 1) as u16;
-        prcb.ProcessorState.SpecialRegisters.Gdtr[2..4].copy_from_slice(&gdt_limit.to_le_bytes());
-        prcb.ProcessorState.SpecialRegisters.Gdtr[4..12].copy_from_slice(&gdt_v.to_le_bytes());
         
-        let idt_limit: u16 = 0x0FFF;
-        prcb.ProcessorState.SpecialRegisters.Idtr[2..4].copy_from_slice(&idt_limit.to_le_bytes());
-        prcb.ProcessorState.SpecialRegisters.Idtr[4..12].copy_from_slice(&idt_v.to_le_bytes());
-
         let kpcr_bytes = unsafe { std::slice::from_raw_parts(&kpcr as *const _ as *const u8, std::mem::size_of::<KPCR>()) };
         vm.write_memory(paddr as usize, kpcr_bytes)?;
-
-        // PRCB 정밀 수동 기록
-        let prcb_p = paddr + 0x180;
-        let thread_p = paddr + 0x5000;
-
-        vm.write_memory((prcb_p + 0x24) as usize, &0u32.to_le_bytes()).ok(); // Number = 0
-        vm.write_memory((prcb_p + 0x28) as usize, &stack_v.to_le_bytes()).ok(); // RspBase
-        vm.write_memory((prcb_p + 0x8) as usize, &dummy_thread_v.to_le_bytes()).ok(); // CurrentThread
         
-        // 1. KPRCB.GroupSetMember (Offset 0x2D8) <- 1 (BSP 활성화)
-        vm.write_memory((prcb_p + 0x2D8) as usize, &1u64.to_le_bytes()).ok();
-
-        // 2. KPRCB APIC ID 삼위일체
-        vm.write_memory((prcb_p + 0xD4) as usize, &[0u8]).ok(); // InitialApicId = 0
-        vm.write_memory((prcb_p + 0x2D0) as usize, &[0u8]).ok(); // ApicId = 0
-
-        // 3. KPROCESS.DirectoryTableBase (Offset 0x28) <- CR3
-        vm.write_memory((paddr + 0x6000 + 0x28) as usize, &cr3.to_le_bytes()).ok();
+        let prcb_bytes = unsafe { std::slice::from_raw_parts(&prcb as *const _ as *const u8, std::mem::size_of::<KPRCB>()) };
+        vm.write_memory((paddr + 0x180) as usize, prcb_bytes)?;
         
-        // 4. KTHREAD 초기화 (베르길리우스 22H2 표준)
-        vm.write_memory((thread_p + 0x28) as usize, &stack_v.to_le_bytes()).ok(); // InitialStack
-        vm.write_memory((thread_p + 0x30) as usize, &(stack_v - 0x10000).to_le_bytes()).ok(); // StackLimit
-        vm.write_memory((thread_p + 0x38) as usize, &stack_v.to_le_bytes()).ok(); // StackBase
+        // KPRCB 정밀 수동 보정
+        vm.write_memory((paddr + 0x180 + 0xc8) as usize, &1u64.to_le_bytes()).ok(); // GroupSetMember
+        vm.write_memory((paddr + 0x180 + 0xd4) as usize, &0u32.to_le_bytes()).ok(); // InitialApicId
         
-        vm.write_memory((thread_p + 0x71) as usize, &[1u8]).ok(); // Running = 1
-        
-        vm.write_memory((thread_p + 0x98) as usize, &dummy_process_v.to_le_bytes()).ok(); // ApcState.Process
-        vm.write_memory((thread_p + 0x220) as usize, &dummy_process_v.to_le_bytes()).ok(); // Process Direct Pointer
-        
-        vm.write_memory((thread_p + 0xC8) as usize, &0u64.to_le_bytes()).ok(); // WaitStatus
-        vm.write_memory((thread_p + 0x184) as usize, &[2u8]).ok(); // State = Running
-        vm.write_memory((thread_p + 0x24a) as usize, &[0u8]).ok(); // [NEW] ApcStateIndex = 0
-        vm.write_memory((thread_p + 0x283) as usize, &[0u8]).ok(); // WaitReason = Executive
-        vm.write_memory((thread_p + 0x1D0) as usize, &[1u8]).ok(); // Affinity (CombinedApicMask)
-        
-        // [CORE FIX] ReadySummary (Offset 0x520) 주입
-        // 스케줄러에게 "8번 우선순위(0x100)에 준비된 스레드가 있다"고 알려 유휴 상태 탈출을 유도합니다.
-        vm.write_memory((prcb_p + 0x520) as usize, &0x100u32.to_le_bytes()).ok();
-
-        // [CORE FIX] 9. KPRCB DispatcherReadyListHead (Offset 0x530) 초기화
-        // 32개의 우선순위 리스트 헤드를 순환 구조(자기 참조)로 만듭니다.
-        for i in 0..32 {
-            let entry_v = prcb_v + 0x530 + (i * 16);
-            let entry_p = prcb_p + 0x530 + (i * 16);
-            vm.write_memory(entry_p as usize, &entry_v.to_le_bytes()).ok(); // Flink
-            vm.write_memory((entry_p + 8) as usize, &entry_v.to_le_bytes()).ok(); // Blink
-        }
-
         Ok(())
     }
 }
 
-/// _LOADER_PARAMETER_BLOCK
+/// _LOADER_PARAMETER_BLOCK - 0x160 bytes
 #[repr(C)]
 pub struct LOADER_PARAMETER_BLOCK {
-    pub OsMajorVersion: ULONG,
-    pub OsMinorVersion: ULONG,
-    pub Size: ULONG,
-    pub OsLoaderSecurityVersion: ULONG,
-    pub LoadOrderListHead: LIST_ENTRY,
-    pub MemoryDescriptorListHead: LIST_ENTRY,
-    pub BootDriverListHead: LIST_ENTRY,
-    pub EarlyLaunchListHead: LIST_ENTRY,
-    pub CoreDriverListHead: LIST_ENTRY,
-    pub CoreExtensionsDriverListHead: LIST_ENTRY,
-    pub TpmCoreDriverListHead: LIST_ENTRY,
-    pub KernelStack: ULONGLONG,
-    pub Prcb: ULONGLONG,
-    pub Process: ULONGLONG,
-    pub Thread: ULONGLONG,
-    pub KernelStackSize: ULONG,
-    pub RegistryLength: ULONG,
-    pub RegistryBase: PVOID,
-    pub ConfigurationRoot: PVOID,
-    pub ArcBootDeviceName: PVOID,
-    pub ArcHalDeviceName: PVOID,
-    pub NtBootPathName: PVOID,
-    pub NtHalPathName: PVOID,
-    pub LoadOptions: PVOID,
-    pub NlsData: PVOID,
-    pub ArcDiskInformation: PVOID,
-    pub Extension: PVOID,
-    pub u: [u8; 0x10],
-    pub FirmwareInformation: [u8; 0x40],
-    pub OsBootstatPathName: PVOID,
-    pub ArcOSDataDeviceName: PVOID,
-    pub ArcWindowsSysPartName: PVOID,
+    pub OsMajorVersion: ULONG,                           // 0x0
+    pub OsMinorVersion: ULONG,                           // 0x4
+    pub Size: ULONG,                                     // 0x8
+    pub OsLoaderSecurityVersion: ULONG,                  // 0xc
+    pub LoadOrderListHead: LIST_ENTRY,                   // 0x10
+    pub MemoryDescriptorListHead: LIST_ENTRY,            // 0x20
+    pub BootDriverListHead: LIST_ENTRY,                  // 0x30
+    pub EarlyLaunchListHead: LIST_ENTRY,                 // 0x40
+    pub CoreDriverListHead: LIST_ENTRY,                  // 0x50
+    pub CoreExtensionsDriverListHead: LIST_ENTRY,        // 0x60
+    pub TpmCoreDriverListHead: LIST_ENTRY,               // 0x70
+    pub KernelStack: ULONGLONG,                          // 0x80
+    pub Prcb: ULONGLONG,                                 // 0x88
+    pub Process: ULONGLONG,                              // 0x90
+    pub Thread: ULONGLONG,                               // 0x98
+    pub KernelStackSize: ULONG,                          // 0xa0
+    pub RegistryLength: ULONG,                           // 0xa4
+    pub RegistryBase: PVOID,                             // 0xa8
+    pub ConfigurationRoot: PVOID,                        // 0xb0
+    pub ArcBootDeviceName: PVOID,                        // 0xb8
+    pub ArcHalDeviceName: PVOID,                         // 0xc0
+    pub NtBootPathName: PVOID,                           // 0xc8
+    pub NtHalPathName: PVOID,                            // 0xd0
+    pub LoadOptions: PVOID,                              // 0xd8
+    pub NlsData: PVOID,                                  // 0xe0
+    pub ArcDiskInformation: PVOID,                       // 0xe8
+    pub Extension: PVOID,                                // 0xf0
+    pub u: [UCHAR; 16],                                  // 0xf8
+    pub FirmwareInformation: [UCHAR; 64],                // 0x108
+    pub OsBootstatPathName: PVOID,                       // 0x148
+    pub ArcOSDataDeviceName: PVOID,                      // 0x150
+    pub ArcWindowsSysPartName: PVOID,                    // 0x158
 }
 
 pub struct LoaderParameterBlock;
@@ -312,22 +289,20 @@ impl LoaderParameterBlock {
         lpb.Size = 0x160;
         lpb.KernelStack = stack_v;
         lpb.Prcb = prcb_v;
-        lpb.Process = prcb_v + 0x5e80;
-        lpb.Thread = prcb_v + 0x4e80;
-        lpb.KernelStackSize = stack_size; // [FIX] 커널 스택 크기 명시
+        lpb.Process = prcb_v + 0x6000;
+        lpb.Thread = prcb_v + 0x5000;
+        lpb.KernelStackSize = stack_size;
         lpb.RegistryLength = registry_size;
         lpb.RegistryBase = registry_v;
-        lpb.ConfigurationRoot = lpb_v + 0x2000;
+        lpb.NlsData = nls_v;
+        lpb.Extension = lpb_v + 0x8000;
         
-        // [CORE FIX] LoadOptions는 반드시 ANSI(ASCII)여야 커널이 인식함
         let options_str = "/DEBUG /DEBUGPORT=COM1 /BAUDRATE=115200 /EMS"; 
         let mut options_bytes = options_str.as_bytes().to_vec();
-        options_bytes.push(0); // Null terminator
+        options_bytes.push(0);
         vm.write_memory((lpb_p + 0xC000) as usize, &options_bytes).ok();
         lpb.LoadOptions = lpb_v + 0xC000;
 
-        lpb.NlsData = nls_v;
-        lpb.Extension = lpb_v + 0x8000;
         let bytes = unsafe { std::slice::from_raw_parts(&lpb as *const _ as *const u8, 0x160) };
         vm.write_memory(lpb_p as usize, bytes)?;
         Ok(())
@@ -343,24 +318,45 @@ impl LoaderParameterBlock {
     }
 }
 
-/// _LOADER_PARAMETER_EXTENSION
+/// _LOADER_PARAMETER_EXTENSION - 0xe38 bytes
 #[repr(C)]
 pub struct LOADER_PARAMETER_EXTENSION {
     pub Size: ULONG,                                    // 0x0
     pub Profile: [UCHAR; 0x14],                         // 0x4
     pub EmInfFileImage: PVOID,                          // 0x18
     pub EmInfFileSize: ULONG,                           // 0x20
-    pub Padding1: [UCHAR; 0x54],                        // 0x24 -> 0x78
+    pub TriageDumpBlock: PVOID,                         // 0x28
+    pub HeadlessLoaderBlock: PVOID,                     // 0x30
+    pub SMBiosEPSHeader: PVOID,                         // 0x38
+    pub DrvDBImage: PVOID,                              // 0x40
+    pub DrvDBSize: ULONG,                               // 0x48
+    pub DrvDBPatchImage: PVOID,                         // 0x50
+    pub DrvDBPatchSize: ULONG,                          // 0x58
+    pub NetworkLoaderBlock: PVOID,                      // 0x60
+    pub FirmwareDescriptorListHead: LIST_ENTRY,         // 0x68
     pub AcpiTable: PVOID,                               // 0x78
     pub AcpiTableSize: ULONG,                           // 0x80
     pub Bitfields: ULONG,                               // 0x84
-    pub LoaderPerformanceData: [UCHAR; 0x60],           // 0x88 -> 0xE8
-    pub Padding2: [UCHAR; 0x998],                       // 0xE8 -> 0xA80
-    pub ApiSetSchema: PVOID,                            // 0xA80
-    pub ApiSetSchemaSize: ULONG,                        // 0xA88
-    pub Padding3: [UCHAR; 0xFC],                        // 0xA8C -> 0xB88
-    pub MajorRelease: ULONG,                            // 0xB88
-    pub MinorRelease: ULONG,                            // 0xB8C
+    pub LoaderPerformanceData: [UCHAR; 0x60],           // 0x88
+    pub BootApplicationPersistentData: LIST_ENTRY,      // 0xe8
+    pub Padding1: [UCHAR; 0x8D0],                       // 0xF8 -> 0x9C8
+    pub ProcessorCounterFrequency: ULONGLONG,           // 0x9c0
+    pub HypervisorExtension: [UCHAR; 0x40],             // 0x9c8
+    pub HardwareConfigurationId: [UCHAR; 16],           // 0xa08
+    pub HalExtensionModuleList: LIST_ENTRY,             // 0xa18
+    pub SystemTime: ULONGLONG,                          // 0xa28
+    pub TimeStampAtSystemTimeRead: ULONGLONG,           // 0xa30
+    pub BootFlags: ULONGLONG,                           // 0xa38
+    pub InternalBootFlags: ULONGLONG,                   // 0xa40
+    pub WfsFPData: PVOID,                               // 0xa48
+    pub WfsFPDataSize: ULONG,                           // 0xa50
+    pub BugcheckParameters: [UCHAR; 0x28],              // 0xa58
+    pub ApiSetSchema: PVOID,                            // 0xa80
+    pub ApiSetSchemaSize: ULONG,                        // 0xa88
+    pub ApiSetSchemaExtensions: LIST_ENTRY,             // 0xa90
+    pub PaddingFinal: [UCHAR; 0x390],                   // 0xaa0 -> 0xe30
+    pub MajorRelease: ULONG,                            // 0xb88
+    pub MinorRelease: ULONG,                            // 0xb8c
 }
 
 pub struct LoaderParameterExtension;
@@ -369,18 +365,14 @@ impl LoaderParameterExtension {
     pub fn setup(vm: &mut Vm, ext_p: u64, ext_v: u64) -> Result<(), &'static str> {
         let mut ext = unsafe { std::mem::zeroed::<LOADER_PARAMETER_EXTENSION>() };
         ext.Size = 0xE38;
-        ext.Bitfields = 0x4000; // LastBootSucceeded
+        ext.Bitfields = 0x4000; 
         ext.MajorRelease = 10;
         ext.MinorRelease = 0;
+        let list_head_v = ext_v + 0xA18;
+        ext.HalExtensionModuleList.Flink = list_head_v;
+        ext.HalExtensionModuleList.Blink = list_head_v;
         let bytes = unsafe { std::slice::from_raw_parts(&ext as *const _ as *const u8, 0xE38) };
         vm.write_memory(ext_p as usize, bytes)?;
-
-        // [CORE FIX] HalExtensionModuleList (Offset 0xA18) 순환 리스트 초기화
-        let list_head_v = ext_v + 0xA18;
-        let list_head_p = ext_p + 0xA18;
-        vm.write_memory(list_head_p as usize, &list_head_v.to_le_bytes()).ok(); // Flink
-        vm.write_memory((list_head_p + 8) as usize, &list_head_v.to_le_bytes()).ok(); // Blink
-
         Ok(())
     }
     pub fn set_acpi(vm: &mut Vm, ext_p: u64, rsdp_v: u64) -> Result<(), &'static str> {
