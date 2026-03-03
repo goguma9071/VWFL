@@ -24,7 +24,7 @@ pub fn run(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> Result<(
     println!("[CPU] Initializing vCPU state...");
     setup_long_mode(vm, krnl_entry_v, stack_v, lpb_v)?;
 
-    let k = false; // true: 디버그 모드, false: 고속 모드
+    let k = true; // true: 디버그 모드, false: 고속 모드
     let debug_control = if k { 0x00000001 | 0x00000002 } else { 0x00000001 };
     vm.vcpu_fd.set_guest_debug(&kvm_bindings::kvm_guest_debug {
         control: debug_control,
@@ -49,14 +49,24 @@ pub fn run(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> Result<(
             }
         }
 
-        // KUSER_SHARED_DATA 시간 업데이트
-        if loop_count % 500 == 0 {
+        // KUSER_SHARED_DATA 시간 업데이트 및 추적 출력
+        let trace_interval = if loop_count <= 100000 { 100 } else { 500 };
+        if loop_count % trace_interval == 0 {
+            let regs = vm.vcpu_fd.get_regs().unwrap_or_default();
+            println!("[TRACE] RIP: 0x{:x} | Count: {}", regs.rip, loop_count);
+
             let kuser_p = crate::KUSER_PBASE;
             let virtual_time = loop_count.wrapping_mul(10000); 
-            let tick_count = (loop_count / 100) as u32;
-            vm.write_memory((kuser_p + 0x08) as usize, &virtual_time.to_le_bytes()).ok();
-            vm.write_memory((kuser_p + 0x18) as usize, &virtual_time.to_le_bytes()).ok();
-            vm.write_memory((kuser_p + 0x320) as usize, &tick_count.to_le_bytes()).ok();
+            let time_bytes = virtual_time.to_le_bytes();
+            let high_bytes = (virtual_time >> 32) as u32;
+            
+            // [CORE FIX] InterruptTime (0x08) & SystemTime (0x14) 업데이트
+            // High1Time과 High2Time을 모두 맞춰줘야 커널 루프를 탈출합니다.
+            vm.write_memory((kuser_p + 0x08) as usize, &time_bytes).ok(); // Low + High1
+            vm.write_memory((kuser_p + 0x10) as usize, &high_bytes.to_le_bytes()).ok(); // High2
+            
+            vm.write_memory((kuser_p + 0x14) as usize, &time_bytes).ok(); // Low + High1
+            vm.write_memory((kuser_p + 0x1C) as usize, &high_bytes.to_le_bytes()).ok(); // High2
         }
 
         let exit_reason = vm.vcpu_fd.run()?; 
