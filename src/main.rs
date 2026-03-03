@@ -122,7 +122,7 @@ fn main() {
     
     Kpcr::setup(&mut vm, KPCR_VBASE, KPCR_PBASE, gdt_v, idt_v, tss_v, stack_v).expect("KPCR Init");
     
-    // [CORE FIX] LPB 기초 설정을 먼저 수행하여 나중에 연결할 리스트 헤더가 덮어씌워지지 않게 함
+    // [CORE FIX] LPB 기초 설정을 가장 먼저 수행하여 나중에 연결할 리스트 헤더가 덮어씌워지지 않게 함
     LoaderParameterBlock::setup(&mut vm, LPB_VBASE, LPB_PBASE, KPCR_VBASE + 0x180, stack_v, 0x10000, hive_v, hive_size, nls_v_base).expect("LPB Init");
     
     // 5. ACPI 및 Extension 초기화
@@ -321,8 +321,8 @@ fn setup_kernel_paging(vm: &mut Vm, _krnl_base: u64, hal_base: u64) -> Result<()
         vm.write_memory((pd_stack_p + j as u64 * 8) as usize, &((phys | 0x83 | nx).to_le_bytes()))?;
     }
     
-    // [CORE FIX] KUSER_SHARED_DATA (0xFFFFF780_00000000)는 PDPT Index 448에 매핑되어야 합니다.
-    vm.write_memory((pdpt_user_p + 448 * 8) as usize, &((pd_user_p | 0x7 | nx).to_le_bytes()))?;
+    // [CORE FIX] KUSER_SHARED_DATA (0xFFFFF780_00000000)는 PDPT Index 0에 위치합니다.
+    vm.write_memory(pdpt_user_p as usize, &((pd_user_p | 0x7 | nx).to_le_bytes()))?;
     for j in 0..512 {
         let phys = KUSER_PBASE + (j as u64 * 0x200000);
         vm.write_memory((pd_user_p + j as u64 * 8) as usize, &((phys | 0x87 | nx).to_le_bytes()))?;

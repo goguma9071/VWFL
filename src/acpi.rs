@@ -97,8 +97,8 @@ fn write_header(data: &mut [u8], sig: &[u8; 4], len: u32, rev: u8) {
     data[0..4].copy_from_slice(sig);
     data[4..8].copy_from_slice(&len.to_le_bytes());
     data[8] = rev;
-    data[10..16].copy_from_slice(b"VWFL  ");
-    data[16..24].copy_from_slice(b"HYPERVIS");
+    data[10..16].copy_from_slice(b"INTEL ");
+    data[16..24].copy_from_slice(b"DELL    ");
 }
 
 fn update_checksum(data: &mut [u8]) {

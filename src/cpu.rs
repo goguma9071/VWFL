@@ -24,7 +24,7 @@ pub fn run(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> Result<(
     println!("[CPU] Initializing vCPU state...");
     setup_long_mode(vm, krnl_entry_v, stack_v, lpb_v)?;
 
-    let k = true; // true: 디버그 모드, false: 고속 모드
+    let k = false; // true: 디버그 모드, false: 고속 모드
     let debug_control = if k { 0x00000001 | 0x00000002 } else { 0x00000001 };
     vm.vcpu_fd.set_guest_debug(&kvm_bindings::kvm_guest_debug {
         control: debug_control,
