@@ -49,15 +49,14 @@ pub struct LDR_DATA_TABLE_ENTRY {
     pub EntryPoint: PVOID,                               // 0x38
     pub SizeOfImage: ULONG,                              // 0x40
     pub Padding_After_Size: ULONG,                       // 0x44
-    pub FullDllName: UNICODE_STRING,                     // 0x48
+    pub FullDllName: UNICODE_STRING,                     // 0x48 (0x44 패딩 포함 자동 정렬)
     pub BaseDllName: UNICODE_STRING,                     // 0x58
     pub Flags: ULONG,                                    // 0x68
     pub ObsoleteLoadCount: USHORT,                       // 0x6c
     pub TlsIndex: USHORT,                                // 0x6e
     pub HashLinks: LIST_ENTRY,                           // 0x70
     pub TimeDateStamp: ULONG,                            // 0x80
-    pub Padding_After_Time: ULONG,                       // 0x84
-    pub EntryPointActivationContext: PVOID,              // 0x88
+    pub EntryPointActivationContext: PVOID,              // 0x88 (0x84 패딩 포함)
     pub Lock: PVOID,                                     // 0x90
     pub DdagNode: PVOID,                                 // 0x98
     pub NodeModuleLink: LIST_ENTRY,                      // 0xa0
@@ -289,8 +288,12 @@ impl LoaderParameterBlock {
         lpb.Size = 0x160;
         lpb.KernelStack = stack_v;
         lpb.Prcb = prcb_v;
-        lpb.Process = prcb_v + 0x6000;
-        lpb.Thread = prcb_v + 0x5000;
+
+        // [CORE FIX] prcb_v는 kpcr + 0x180이므로, kpcr 베이스를 먼저 구함
+        let kpcr_v = prcb_v - 0x180;
+        lpb.Process = kpcr_v + 0x6000;
+        lpb.Thread = kpcr_v + 0x5000;
+
         lpb.KernelStackSize = stack_size;
         lpb.RegistryLength = registry_size;
         lpb.RegistryBase = registry_v;
