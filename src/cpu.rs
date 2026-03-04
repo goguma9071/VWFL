@@ -25,7 +25,12 @@ pub fn run(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> Result<(
     setup_long_mode(vm, krnl_entry_v, stack_v, lpb_v)?;
 
     let k = true; // true: 디버그 모드, false: 고속 모드
-    let debug_control = if k { 0x00000001 | 0x00000002 } else { 0x00000001 };
+    // [Category 1] Single Step 활성화: 매 명령어마다 하이퍼바이저로 Exit 발생시킴
+    let debug_control = if k { 
+        kvm_bindings::KVM_GUESTDBG_ENABLE | kvm_bindings::KVM_GUESTDBG_SINGLESTEP | kvm_bindings::KVM_GUESTDBG_USE_HW_BP
+    } else { 
+        kvm_bindings::KVM_GUESTDBG_ENABLE 
+    };
     vm.vcpu_fd.set_guest_debug(&kvm_bindings::kvm_guest_debug {
         control: debug_control,
         ..Default::default() 
@@ -35,10 +40,33 @@ pub fn run(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> Result<(
 
     let mut loop_count: u64 = 0;
     let mut last_rip: u64 = 0;
-    let mut hang_count: u32 = 0;
+    let mut rip_history: [u64; 100] = [0; 100]; // [Category 1] 최근 100개 RIP 추적용
+    let mut history_idx = 0;
+    let mut hang_count = 0;
 
     loop {
         loop_count += 1;
+        
+        let regs = vm.vcpu_fd.get_regs().unwrap_or_default();
+        rip_history[history_idx] = regs.rip;
+        history_idx = (history_idx + 1) % 100;
+
+        // 루프 감지 (동일 RIP에서 1000번 이상 vCPU Exit 발생 시)
+        if regs.rip == last_rip {
+            hang_count += 1;
+            if hang_count > 1000 {
+                println!("\n[DETECT] Potential Hang at RIP: 0x{:x}", regs.rip);
+                println!("[TRACE] Last 10 RIPs in history:");
+                for i in 1..=10 {
+                    let prev_idx = (history_idx + 100 - i) % 100;
+                    println!("  - 0x{:x}", rip_history[prev_idx]);
+                }
+                return debug::dump_all_registers(vm);
+            }
+        } else {
+            last_rip = regs.rip;
+            hang_count = 0;
+        }
         
         {
             let mut kvm_run = vm.vcpu_fd.get_kvm_run();
@@ -84,7 +112,7 @@ pub fn run(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> Result<(
                     match addr {
                         0x3F8 => data[0] = 0,
                         0x3FA => data[0] = 1,
-                        0x3FD => data[0] = 0x60,
+                        0x3FD => data[0] = 0x60, // [CORE FIX] LSR: Transmitter Ready
                         0x3FE => data[0] = 0xB0,
                         _ => data[0] = 0,
                     }
@@ -101,16 +129,15 @@ pub fn run(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> Result<(
                         val = match addr & 0xFFF {
                             0x20 => 0x0,      // APIC ID
                             0x30 => 0x50014,  // VERSION
-                            0x80 => APIC.tpr, // TPR (Task Priority)
-                            0xF0 => APIC.svr, // SVR (Spurious Vector)
+                            0x80 => APIC.tpr, 
+                            0xF0 => APIC.svr, 
                             0x320 => APIC.lvt_timer,
                             0x380 => APIC.init_count,
                             0x390 => {
-                                // [CORE FIX] 타이머 카운트다운 시뮬레이션
-                                // 초기값에서 loop_count의 일부를 뺀 값을 주어 숫자가 줄어들게 만듭니다.
+                                // [CORE FIX] 타이머 카운트다운 시뮬레이션 보강
                                 if APIC.init_count > 0 {
-                                    APIC.init_count.saturating_sub((loop_count % 1000) as u32)
-                                } else { 0 }
+                                    APIC.init_count.wrapping_sub((loop_count & 0xFFFF) as u32)
+                                } else { 0x100000 }
                             },
                             _ => 0,
                         };
@@ -150,7 +177,7 @@ pub fn run(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> Result<(
         };
 
         match action {
-            LoopAction::Trace if k && loop_count % 50 == 0 => {
+            LoopAction::Trace if k && loop_count % 100 == 0 => {
                 let regs = vm.vcpu_fd.get_regs().ok();
                 println!("[TRACE] RIP: 0x{:016x?} | Count: {}", regs.as_ref().map(|r| r.rip), loop_count);
             }
@@ -158,11 +185,17 @@ pub fn run(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> Result<(
                 print!("{}", c as char);
                 io::stdout().flush()?;
             }
+            LoopAction::LogIoIn(addr) => {
+                if loop_count % 100 == 0 { println!("[IO IN  ] Port: 0x{:x}", addr); }
+            }
+            LoopAction::LogIoOut(addr, val) => {
+                if loop_count % 100 == 0 { println!("[IO OUT ] Port: 0x{:x}, Val: 0x{:x}", addr, val); }
+            }
             LoopAction::LogMmioRead(addr) => {
-                if !k && loop_count % 1000 == 0 { println!("[MMIO READ ] Addr: 0x{:x}", addr); }
+                if loop_count % 100 == 0 { println!("[MMIO R ] Addr: 0x{:x}", addr); }
             }
             LoopAction::LogMmioWrite(addr, val) => {
-                if !k && loop_count % 1000 == 0 { println!("[MMIO WRITE] Addr: 0x{:x}, Val: 0x{:x}", addr, val); }
+                if loop_count % 100 == 0 { println!("[MMIO W ] Addr: 0x{:x}, Val: 0x{:x}", addr, val); }
             }
             LoopAction::LogApic(addr, val, is_write) => {
                 if loop_count % 100 == 0 {
@@ -174,9 +207,18 @@ pub fn run(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> Result<(
                     else { println!("[APIC R] {}: 0x{:x}", reg_name, val); }
                 }
             }
+            LoopAction::LogOther(msg) => {
+                println!("[EXIT] Unknown Reason: {}", msg);
+            }
             LoopAction::Trap(v) => debug::handle_diagnostic_trap(vm, v)?,
             LoopAction::Dump(msg) => {
                 println!("\nKVM EXIT: {}", msg);
+                // [Category 1] 명령어 디코딩 추가
+                let regs = vm.vcpu_fd.get_regs().unwrap_or_default();
+                let mut code = [0u8; 15];
+                if vm.read_memory((regs.rip) as usize, &mut code).is_ok() {
+                    println!("[DECODE] Instruction at 0x{:x}: {:02X?}", regs.rip, code);
+                }
                 return debug::dump_all_registers(vm);
             }
             _ => {}

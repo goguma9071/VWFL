@@ -267,6 +267,7 @@ fn setup_kernel_paging(vm: &mut Vm, _krnl_base: u64, hal_base: u64) -> Result<()
     let pd_stack_p    = paging_pbase + 0xB000;
     let pdpt_user_p   = paging_pbase + 0x5000; 
     let pd_user_p     = paging_pbase + 0xC000;
+    let pt_user_p     = paging_pbase + 0x15000; // [NEW] KUSER 전용 PTE 테이블
     let bridge_p      = paging_pbase + 0x50000;
     let krnl_pml4_idx = 496; 
     let nx: u64 = 1 << 63;
@@ -274,19 +275,18 @@ fn setup_kernel_paging(vm: &mut Vm, _krnl_base: u64, hal_base: u64) -> Result<()
     vm.write_memory(paging_pbase as usize, &[0u8; 524288])?; 
     vm.write_memory(bridge_p as usize, &[0x0F, 0x01, 0xC1]).ok(); 
 
+    // --- PML4 Table ---
     vm.write_memory((pml4_p + krnl_pml4_idx * 8) as usize, &((pdpt_high_p | 0x3).to_le_bytes()))?;
     vm.write_memory((pml4_p + 511 * 8) as usize, &((pdpt_high_p | 0x3).to_le_bytes()))?; 
     vm.write_memory(pml4_p as usize, &((pdpt_low_p | 0x3).to_le_bytes()))?; 
     vm.write_memory((pml4_p + 509*8) as usize, &((pdpt_stack_p | 0x3 | nx).to_le_bytes()))?;
-    vm.write_memory((pml4_p + 495*8) as usize, &((pdpt_user_p | 0x7 | nx).to_le_bytes()))?;
-    vm.write_memory((pml4_p + 510*8) as usize, &((pml4_p | 0x3 | nx).to_le_bytes()))?;
+    // [CORE FIX] PML4 495번에 전용 PDPT 연결 (nx 제거)
+    vm.write_memory((pml4_p + 495*8) as usize, &((pdpt_user_p | 0x7).to_le_bytes()))?; 
     vm.write_memory((pml4_p + 493*8) as usize, &((pml4_p | 0x3 | nx).to_le_bytes()))?; 
 
+    // --- High-Half (Kernel & HAL) ---
     vm.write_memory(pdpt_high_p as usize, &((pd_kernel_p | 0x3).to_le_bytes()))?;
     vm.write_memory((pdpt_high_p + 8) as usize, &((pd_hal_p | 0x3).to_le_bytes()))?; 
-
-    vm.write_memory((pdpt_low_p + 6 * 8) as usize, &((pd_hal_p | 0x3).to_le_bytes()))?;
-    vm.write_memory((pdpt_low_p + 7 * 8) as usize, &((pd_hal_p | 0x3).to_le_bytes()))?;
 
     for j in 0..512 {
         let phys = j as u64 * 0x200000;
@@ -300,33 +300,31 @@ fn setup_kernel_paging(vm: &mut Vm, _krnl_base: u64, hal_base: u64) -> Result<()
         vm.write_memory(entry_addr as usize, &((phys | 0x83).to_le_bytes()))?;
     }
     
+    // --- MMIO (APIC/IOAPIC) ---
     let pd_mmio_p = paging_pbase + 0x60000; 
     let pt_ioapic_p = paging_pbase + 0x61000; 
     let pt_apic_p = paging_pbase + 0x62000; 
-    
-    vm.write_memory(pd_mmio_p as usize, &[0u8; 4096]).ok();
-    vm.write_memory(pt_ioapic_p as usize, &[0u8; 4096]).ok();
-    vm.write_memory(pt_apic_p as usize, &[0u8; 4096]).ok();
-
     vm.write_memory((pdpt_high_p + 3*8) as usize, &((pd_mmio_p | 0x3).to_le_bytes())).ok();
     vm.write_memory((pd_mmio_p + 502*8) as usize, &((pt_ioapic_p | 0x3).to_le_bytes())).ok();
     vm.write_memory((pd_mmio_p + 503*8) as usize, &((pt_apic_p | 0x3).to_le_bytes())).ok();
-
     vm.write_memory(pt_ioapic_p as usize, &((0xFEC00000u64 | 0x1B | nx).to_le_bytes())).ok();
     vm.write_memory(pt_apic_p as usize, &((0xFEE00000u64 | 0x1B | nx).to_le_bytes())).ok();
 
+    // --- Stack ---
     vm.write_memory(pdpt_stack_p as usize, &((pd_stack_p | 0x3 | nx).to_le_bytes()))?;
     for j in 0..512 {
         let phys = STACK_PBASE + (j as u64 * 0x200000);
         vm.write_memory((pd_stack_p + j as u64 * 8) as usize, &((phys | 0x83 | nx).to_le_bytes()))?;
     }
     
-    // [CORE FIX] KUSER_SHARED_DATA (0xFFFFF780_00000000)는 PDPT Index 0에 위치합니다.
-    vm.write_memory(pdpt_user_p as usize, &((pd_user_p | 0x7 | nx).to_le_bytes()))?;
-    for j in 0..512 {
-        let phys = KUSER_PBASE + (j as u64 * 0x200000);
-        vm.write_memory((pd_user_p + j as u64 * 8) as usize, &((phys | 0x87 | nx).to_le_bytes()))?;
-    }
+    // --- KUSER_SHARED_DATA (4-Level Mapping) ---
+    // Level 3: PDPT[0] -> PDE
+    vm.write_memory(pdpt_user_p as usize, &((pd_user_p | 0x7).to_le_bytes()))?;
+    // Level 2: PDE[0] -> PTE (Large Page 아님)
+    vm.write_memory(pd_user_p as usize, &((pt_user_p | 0x7).to_le_bytes()))?;
+    // Level 1: PTE[0] -> Physical Page (4KB)
+    vm.write_memory(pt_user_p as usize, &((KUSER_PBASE | 0x7).to_le_bytes()))?;
+
     Ok(())
 }
 
