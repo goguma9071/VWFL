@@ -7,6 +7,7 @@ mod pe;
 mod vm;
 mod forwarder;
 mod nt_types;
+mod gdb;
 
 use std::env;
 use std::fs;

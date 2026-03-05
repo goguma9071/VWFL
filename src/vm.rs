@@ -84,6 +84,16 @@ impl Vm {
         println!("[VM] MMIO Hole (3GB-4GB) created. Memory split into 2 slots.");
 
         let vcpu_fd = vm_fd.create_vcpu(0)?;
+
+        // [CORE FIX] TSC 주파수 고정 설정
+        // 특정 버전의 kvm-ioctls에서 get_tsc_khz가 없을 수 있으므로, 
+        // 윈도우 부팅에 권장되는 표준 주파수(예: 3.6GHz = 3600000 KHz)를 시도하거나 
+        // 하드웨어 지원 여부를 체크합니다.
+        let target_tsc_khz = 3600000; // 3.6 GHz
+        if vcpu_fd.set_tsc_khz(target_tsc_khz).is_ok() {
+            println!("[VM] TSC Frequency set to: {} KHz", target_tsc_khz);
+        }
+
         let debug_struct = kvm_bindings::kvm_guest_debug {
             control: kvm_bindings::KVM_GUESTDBG_ENABLE | kvm_bindings::KVM_GUESTDBG_USE_SW_BP,
             ..Default::default()

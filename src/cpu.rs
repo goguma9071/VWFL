@@ -4,6 +4,8 @@ use kvm_bindings::{kvm_msr_entry, Msrs};
 use crate::debug::dump_all_registers;
 use std::io::{self, Write};
 use crate::debug;
+use std::collections::VecDeque;
+use iced_x86::{Decoder, DecoderOptions, Formatter, IntelFormatter};
 
 // [CORE FIX] 하이퍼바이저 수준의 최소 APIC 상태 저장소
 struct ApicState {
@@ -24,10 +26,11 @@ pub fn run(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> Result<(
     println!("[CPU] Initializing vCPU state...");
     setup_long_mode(vm, krnl_entry_v, stack_v, lpb_v)?;
 
-    let k = true; // true: 디버그 모드, false: 고속 모드
-    // [Category 1] Single Step 활성화: 매 명령어마다 하이퍼바이저로 Exit 발생시킴
+    let k = true; 
+    let mut history: VecDeque<(u64, String)> = VecDeque::with_capacity(100);
+
     let debug_control = if k { 
-        kvm_bindings::KVM_GUESTDBG_ENABLE | kvm_bindings::KVM_GUESTDBG_SINGLESTEP | kvm_bindings::KVM_GUESTDBG_USE_HW_BP
+        kvm_bindings::KVM_GUESTDBG_ENABLE | kvm_bindings::KVM_GUESTDBG_SINGLESTEP 
     } else { 
         kvm_bindings::KVM_GUESTDBG_ENABLE 
     };
@@ -40,36 +43,43 @@ pub fn run(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> Result<(
 
     let mut loop_count: u64 = 0;
     let mut last_rip: u64 = 0;
-    let mut rip_history: [u64; 100] = [0; 100]; // [Category 1] 최근 100개 RIP 추적용
-    let mut history_idx = 0;
-    let mut hang_count = 0;
+    let mut rip_repeat_count: u32 = 0;
 
     loop {
         loop_count += 1;
         
         let regs = vm.vcpu_fd.get_regs().unwrap_or_default();
-        rip_history[history_idx] = regs.rip;
-        history_idx = (history_idx + 1) % 100;
 
-        // 루프 감지 (동일 RIP에서 1000번 이상 vCPU Exit 발생 시)
+        // [CORE FIX] Instruction Replayer - 비침해적 명령어 기록 및 중복 감지
         if regs.rip == last_rip {
-            hang_count += 1;
-            if hang_count > 1000 {
-                println!("\n[DETECT] Potential Hang at RIP: 0x{:x}", regs.rip);
-                println!("[TRACE] Last 10 RIPs in history:");
-                for i in 1..=10 {
-                    let prev_idx = (history_idx + 100 - i) % 100;
-                    println!("  - 0x{:x}", rip_history[prev_idx]);
-                }
-                return debug::dump_all_registers(vm);
-            }
+            rip_repeat_count += 1;
         } else {
             last_rip = regs.rip;
-            hang_count = 0;
+            rip_repeat_count = 0;
+            
+            let mut code = [0u8; 15];
+            if vm.read_memory((regs.rip & 0x0FFFFFFF) as usize, &mut code).is_ok() {
+                let mut decoder = Decoder::with_ip(64, &code, regs.rip, DecoderOptions::NONE);
+                let instruction = decoder.decode();
+                let mut output = String::new();
+                let mut formatter = IntelFormatter::new();
+                formatter.format(&instruction, &mut output);
+                
+                if history.len() >= 1000 { history.pop_front(); }
+                history.push_back((regs.rip, output));
+            }
         }
         
+        // [DEBUG] 과도한 루프 감지 (Hang 탐지 대신 경고만 출력)
+        if rip_repeat_count > 100000 {
+            if rip_repeat_count % 50000 == 0 {
+                println!("[WARN] CPU seems to be stuck at RIP: 0x{:x} (Repeated {} times)", regs.rip, rip_repeat_count);
+            }
+        }
+
         {
             let mut kvm_run = vm.vcpu_fd.get_kvm_run();
+// ... (rest of the code update will be handled in a larger block or multiple calls)
             if kvm_run.ready_for_interrupt_injection == 0 {
                 kvm_run.request_interrupt_window = 1;
             } else {
@@ -171,7 +181,12 @@ pub fn run(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> Result<(
                 }
             }
             VcpuExit::Debug(_) => LoopAction::Trace,
-            VcpuExit::Hlt => LoopAction::Dump("HLT (CPU Idle)".to_string()),
+            VcpuExit::Hlt => {
+                // Windows 커널은 대기 상태에서 HLT를 호출할 수 있습니다.
+                // 루프를 완전히 멈추는 대신 로그를 남기고 다음 인터럽트를 기다리도록 합니다.
+                if loop_count % 1000 == 0 { println!("[DEBUG] CPU HLT (Idle/Waiting)"); }
+                LoopAction::None
+            }
             VcpuExit::Shutdown => LoopAction::Dump("Shutdown (Triple Fault)".to_string()),
             other => LoopAction::LogOther(format!("{:?}", other)),
         };
@@ -327,4 +342,5 @@ fn setup_long_mode(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> 
     regs.rdx = lpb_v; 
     vm.vcpu_fd.set_regs(&regs)?;
     Ok(())
+    
 }
