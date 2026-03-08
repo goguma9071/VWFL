@@ -1,13 +1,17 @@
 use crate::vm::Vm;
 use kvm_ioctls::VcpuExit;
 use kvm_bindings::{kvm_msr_entry, Msrs};
-use crate::debug::dump_all_registers;
 use std::io::{self, Write};
 use crate::debug;
-use std::collections::VecDeque;
-use iced_x86::{Decoder, DecoderOptions, Formatter, IntelFormatter};
+use std::net::{TcpListener, TcpStream};
+use gdbstub::stub::GdbStub;
+use gdbstub::stub::run_blocking::{BlockingEventLoop, Event as GdbEvent, WaitForStopReasonError};
+use gdbstub::stub::{BaseStopReason, DisconnectReason};
+use crate::gdb::{VwflTarget, GdbResumeAction};
+use gdbstub::common::Tid;
+use std::marker::PhantomData;
+use gdbstub::conn::{Connection, ConnectionExt};  
 
-// [CORE FIX] 하이퍼바이저 수준의 최소 APIC 상태 저장소
 struct ApicState {
     tpr: u32,
     svr: u32,
@@ -17,252 +21,158 @@ struct ApicState {
 
 static mut APIC: ApicState = ApicState {
     tpr: 0,
-    svr: 0x1FF, // 기본값: SVR Enabled
-    lvt_timer: 0x10000, // Masked
+    svr: 0x1FF, 
+    lvt_timer: 0x10000, 
     init_count: 0,
 };
 
 pub fn run(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> Result<(), Box<dyn std::error::Error>> {
     println!("[CPU] Initializing vCPU state...");
     setup_long_mode(vm, krnl_entry_v, stack_v, lpb_v)?;
+    run_gdb_server(vm)
+}
 
-    let k = true; 
-    let mut history: VecDeque<(u64, String)> = VecDeque::with_capacity(100);
+fn run_gdb_server(vm: &mut Vm) -> Result<(), Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind("127.0.0.1:1234")?;
+    println!("\n--- GDB Server Started ---");
+    println!("Waiting for GDB connection on 127.0.0.1:1234...");
+    
+    let (stream, addr) = listener.accept()?;
+    println!("GDB Client Connected: {}", addr);
+    
+    stream.set_nonblocking(true)?;
 
-    let debug_control = if k { 
-        kvm_bindings::KVM_GUESTDBG_ENABLE | kvm_bindings::KVM_GUESTDBG_SINGLESTEP 
-    } else { 
-        kvm_bindings::KVM_GUESTDBG_ENABLE 
-    };
-    vm.vcpu_fd.set_guest_debug(&kvm_bindings::kvm_guest_debug {
-        control: debug_control,
-        ..Default::default() 
-    }).ok();
+    let mut target = VwflTarget { vm, resume_action: None };
+    let gdb = GdbStub::new(stream);
 
-    println!("\n--- KVM vCPU Start (Debug Mode: {}) ---", k);
+    match gdb.run_blocking::<VwflEventLoop<'_>>(&mut target)? {
+        DisconnectReason::Disconnect => println!("[GDB] Disconnected."),
+        DisconnectReason::Kill => println!("[GDB] Killed by client."),
+        _ => println!("[GDB] Stopped."),
+    }
 
-    let mut loop_count: u64 = 0;
-    let mut last_rip: u64 = 0;
-    let mut rip_repeat_count: u32 = 0;
+    Ok(())
+}
 
-    loop {
-        loop_count += 1;
+struct VwflEventLoop<'a> {
+    _phantom: PhantomData<&'a ()>,
+}
+
+impl<'a> BlockingEventLoop for VwflEventLoop<'a> {
+    type Target = VwflTarget<'a>;
+    type Connection = TcpStream;
+    type StopReason = BaseStopReason<Tid, u64>;
+
+    fn wait_for_stop_reason(
+        target: &mut Self::Target,
+        conn: &mut Self::Connection,
+    ) -> Result<GdbEvent<Self::StopReason>, WaitForStopReasonError<&'static str, std::io::Error>> {
+        let mut loop_count: u64 = 0;
         
-        let regs = vm.vcpu_fd.get_regs().unwrap_or_default();
-
-        // [CORE FIX] Instruction Replayer - 비침해적 명령어 기록 및 중복 감지
-        if regs.rip == last_rip {
-            rip_repeat_count += 1;
-        } else {
-            last_rip = regs.rip;
-            rip_repeat_count = 0;
+        loop {
+            loop_count += 1;
             
-            let mut code = [0u8; 15];
-            if vm.read_memory((regs.rip & 0x0FFFFFFF) as usize, &mut code).is_ok() {
-                let mut decoder = Decoder::with_ip(64, &code, regs.rip, DecoderOptions::NONE);
-                let instruction = decoder.decode();
-                let mut output = String::new();
-                let mut formatter = IntelFormatter::new();
-                formatter.format(&instruction, &mut output);
-                
-                if history.len() >= 1000 { history.pop_front(); }
-                history.push_back((regs.rip, output));
+            // [FIX] gdbstub::conn::Connection 규격에 맞게 수정
+            match conn.peek().map_err(WaitForStopReasonError::Connection)? {
+                Some(byte) => {
+                    // 데이터가 있으면 읽어서 소모하고 IncomingData로 보고
+                    let _ = conn.read().map_err(WaitForStopReasonError::Connection)?;
+                    return Ok(GdbEvent::IncomingData(byte));
+                }
+                None => {}
             }
-        }
-        
-        // [DEBUG] 과도한 루프 감지 (Hang 탐지 대신 경고만 출력)
-        if rip_repeat_count > 100000 {
-            if rip_repeat_count % 50000 == 0 {
-                println!("[WARN] CPU seems to be stuck at RIP: 0x{:x} (Repeated {} times)", regs.rip, rip_repeat_count);
+
+            if loop_count % 1000 == 0 {
+                update_windows_time(target.vm, loop_count);
             }
-        }
 
-        {
-            let mut kvm_run = vm.vcpu_fd.get_kvm_run();
-// ... (rest of the code update will be handled in a larger block or multiple calls)
-            if kvm_run.ready_for_interrupt_injection == 0 {
-                kvm_run.request_interrupt_window = 1;
-            } else {
-                kvm_run.request_interrupt_window = 0;
+            {
+                let mut kvm_run = target.vm.vcpu_fd.get_kvm_run();
+                kvm_run.request_interrupt_window = 1; 
             }
-        }
 
-        // KUSER_SHARED_DATA 시간 업데이트 및 추적 출력
-        let trace_interval = if loop_count <= 100000 { 100 } else { 500 };
-        if loop_count % trace_interval == 0 {
-            let regs = vm.vcpu_fd.get_regs().unwrap_or_default();
-            println!("[TRACE] RIP: 0x{:x} | Count: {}", regs.rip, loop_count);
+            let exit = target.vm.vcpu_fd.run().map_err(|_| WaitForStopReasonError::Target("KVM Run Error"))?;
 
-            let kuser_p = crate::KUSER_PBASE;
-            let virtual_time = loop_count.wrapping_mul(10000); 
-            let time_bytes = virtual_time.to_le_bytes();
-            let high_bytes = (virtual_time >> 32) as u32;
-            
-            // [CORE FIX] InterruptTime (0x08) & SystemTime (0x14) 업데이트
-            // High1Time과 High2Time을 모두 맞춰줘야 커널 루프를 탈출합니다.
-            vm.write_memory((kuser_p + 0x08) as usize, &time_bytes).ok(); // Low + High1
-            vm.write_memory((kuser_p + 0x10) as usize, &high_bytes.to_le_bytes()).ok(); // High2
-            
-            vm.write_memory((kuser_p + 0x14) as usize, &time_bytes).ok(); // Low + High1
-            vm.write_memory((kuser_p + 0x1C) as usize, &high_bytes.to_le_bytes()).ok(); // High2
-        }
-
-        let exit_reason = vm.vcpu_fd.run()?; 
-
-        let action = match exit_reason {
-            VcpuExit::IrqWindowOpen => LoopAction::Trace,
-            VcpuExit::IoOut(addr, data) => {
-                let val = if data.is_empty() { 0 } else { data[0] };
-                if addr == 0xF9 { LoopAction::Trap(val) }
-                else if addr == 0x3F8 || addr == 0xF8 || addr == 0x80 { LoopAction::SerialOut(val) }
-                else { LoopAction::LogIoOut(addr, val) }
-            }
-            VcpuExit::IoIn(addr, data) => {
-                if !data.is_empty() {
-                    match addr {
-                        0x3F8 => data[0] = 0,
-                        0x3FA => data[0] = 1,
-                        0x3FD => data[0] = 0x60, // [CORE FIX] LSR: Transmitter Ready
-                        0x3FE => data[0] = 0xB0,
-                        _ => data[0] = 0,
+            match exit {
+                VcpuExit::Debug(_) => {
+                    return Ok(GdbEvent::TargetStopped(BaseStopReason::DoneStep));
+                }
+                VcpuExit::IrqWindowOpen => {
+                    continue;
+                }
+                VcpuExit::IoOut(addr, data) => {
+                    let val = data[0];
+                    if addr == 0xF9 { 
+                        debug::handle_diagnostic_trap(target.vm, val).ok();
+                        return Ok(GdbEvent::TargetStopped(BaseStopReason::Signal(gdbstub::common::Signal::SIGTRAP)));
                     }
+                    if addr == 0x3F8 { print!("{}", val as char); io::stdout().flush().ok(); }
                 }
-                LoopAction::LogIoIn(addr)
-            }
-            VcpuExit::MmioRead(addr, data) => {
-                let mut val = 0u32;
-                let mut is_apic = false;
-
-                if addr >= 0xfee00000 && addr <= 0xfee00fff {
-                    is_apic = true;
-                    unsafe {
-                        val = match addr & 0xFFF {
-                            0x20 => 0x0,      // APIC ID
-                            0x30 => 0x50014,  // VERSION
-                            0x80 => APIC.tpr, 
-                            0xF0 => APIC.svr, 
-                            0x320 => APIC.lvt_timer,
-                            0x380 => APIC.init_count,
-                            0x390 => {
-                                // [CORE FIX] 타이머 카운트다운 시뮬레이션 보강
-                                if APIC.init_count > 0 {
-                                    APIC.init_count.wrapping_sub((loop_count & 0xFFFF) as u32)
-                                } else { 0x100000 }
-                            },
-                            _ => 0,
-                        };
-                    }
+                VcpuExit::MmioRead(addr, data) => {
+                    handle_mmio_read(addr, data, loop_count);
                 }
-
-                let bytes = val.to_le_bytes();
-                let len = data.len().min(4);
-                data[..len].copy_from_slice(&bytes[..len]);
-
-                if is_apic { LoopAction::LogApic(addr, val, false) }
-                else { LoopAction::LogMmioRead(addr) }
-            }
-            VcpuExit::MmioWrite(addr, data) => {
-                let val = if data.len() >= 4 { u32::from_le_bytes(data[0..4].try_into().unwrap()) } 
-                          else if data.len() >= 1 { data[0] as u32 } else { 0 };
-                
-                if addr >= 0xfee00000 && addr <= 0xfee00fff {
-                    unsafe {
-                        match addr & 0xFFF {
-                            0x80  => APIC.tpr = val,
-                            0xF0  => APIC.svr = val,
-                            0x320 => APIC.lvt_timer = val,
-                            0x380 => APIC.init_count = val,
-                            _ => {}
-                        }
-                    }
-                    LoopAction::LogApic(addr, val, true)
-                } else {
-                    LoopAction::LogMmioWrite(addr, val)
+                VcpuExit::MmioWrite(addr, data) => {
+                    handle_mmio_write(addr, data);
+                }
+                VcpuExit::Hlt => continue,
+                VcpuExit::Shutdown => {
+                    return Ok(GdbEvent::TargetStopped(BaseStopReason::Signal(gdbstub::common::Signal::SIGSEGV)));
+                }
+                _ => {
+                    return Ok(GdbEvent::TargetStopped(BaseStopReason::Signal(gdbstub::common::Signal::SIGTRAP)));
                 }
             }
-            VcpuExit::Debug(_) => LoopAction::Trace,
-            VcpuExit::Hlt => {
-                // Windows 커널은 대기 상태에서 HLT를 호출할 수 있습니다.
-                // 루프를 완전히 멈추는 대신 로그를 남기고 다음 인터럽트를 기다리도록 합니다.
-                if loop_count % 1000 == 0 { println!("[DEBUG] CPU HLT (Idle/Waiting)"); }
-                LoopAction::None
-            }
-            VcpuExit::Shutdown => LoopAction::Dump("Shutdown (Triple Fault)".to_string()),
-            other => LoopAction::LogOther(format!("{:?}", other)),
-        };
-
-        match action {
-            LoopAction::Trace if k && loop_count % 100 == 0 => {
-                let regs = vm.vcpu_fd.get_regs().ok();
-                println!("[TRACE] RIP: 0x{:016x?} | Count: {}", regs.as_ref().map(|r| r.rip), loop_count);
-            }
-            LoopAction::SerialOut(c) => {
-                print!("{}", c as char);
-                io::stdout().flush()?;
-            }
-            LoopAction::LogIoIn(addr) => {
-                if loop_count % 100 == 0 { println!("[IO IN  ] Port: 0x{:x}", addr); }
-            }
-            LoopAction::LogIoOut(addr, val) => {
-                if loop_count % 100 == 0 { println!("[IO OUT ] Port: 0x{:x}, Val: 0x{:x}", addr, val); }
-            }
-            LoopAction::LogMmioRead(addr) => {
-                if loop_count % 100 == 0 { println!("[MMIO R ] Addr: 0x{:x}", addr); }
-            }
-            LoopAction::LogMmioWrite(addr, val) => {
-                if loop_count % 100 == 0 { println!("[MMIO W ] Addr: 0x{:x}, Val: 0x{:x}", addr, val); }
-            }
-            LoopAction::LogApic(addr, val, is_write) => {
-                if loop_count % 100 == 0 {
-                    let reg_name = match addr & 0xFFF {
-                        0x20 => "ID", 0x30 => "VER", 0x80 => "TPR", 0xB0 => "EOI", 0xF0 => "SVR",
-                        0x320 => "LVT_TMR", 0x380 => "INIT_CNT", 0x390 => "CUR_CNT", _ => "UNK",
-                    };
-                    if is_write { println!("[APIC W] {}: 0x{:x}", reg_name, val); }
-                    else { println!("[APIC R] {}: 0x{:x}", reg_name, val); }
-                }
-            }
-            LoopAction::LogOther(msg) => {
-                println!("[EXIT] Unknown Reason: {}", msg);
-            }
-            LoopAction::Trap(v) => debug::handle_diagnostic_trap(vm, v)?,
-            LoopAction::Dump(msg) => {
-                println!("\nKVM EXIT: {}", msg);
-                // [Category 1] 명령어 디코딩 추가
-                let regs = vm.vcpu_fd.get_regs().unwrap_or_default();
-                let mut code = [0u8; 15];
-                if vm.read_memory((regs.rip) as usize, &mut code).is_ok() {
-                    println!("[DECODE] Instruction at 0x{:x}: {:02X?}", regs.rip, code);
-                }
-                return debug::dump_all_registers(vm);
-            }
-            _ => {}
         }
+    }
 
-        if loop_count % 50000 == 0 {
-            let regs = vm.vcpu_fd.get_regs().ok();
-            println!("[DEBUG] Alive | Loop: {} | RIP: 0x{:016x?}", loop_count, regs.map(|r| r.rip));
+    fn on_interrupt(_target: &mut Self::Target) -> Result<Option<Self::StopReason>, &'static str> {
+        Ok(Some(BaseStopReason::Signal(gdbstub::common::Signal::SIGINT)))
+    }
+}
+
+fn update_windows_time(vm: &mut Vm, count: u64) {
+    let kuser_p = 0x9000000;
+    let virtual_time = count.wrapping_mul(10000); 
+    let time_bytes = virtual_time.to_le_bytes();
+    let high_bytes = (virtual_time >> 32) as u32;
+    vm.write_memory((kuser_p + 0x08) as usize, &time_bytes).ok(); 
+    vm.write_memory((kuser_p + 0x10) as usize, &high_bytes.to_le_bytes()).ok(); 
+    vm.write_memory((kuser_p + 0x14) as usize, &time_bytes).ok(); 
+    vm.write_memory((kuser_p + 0x1C) as usize, &high_bytes.to_le_bytes()).ok(); 
+}
+
+fn handle_mmio_read(addr: u64, data: &mut [u8], loop_count: u64) {
+    if addr >= 0xfee00000 && addr <= 0xfee00fff {
+        unsafe {
+            let val = match addr & 0xFFF {
+                0x20 => 0x0, 0x30 => 0x50014, 0x80 => APIC.tpr, 0xF0 => APIC.svr,
+                0x320 => APIC.lvt_timer, 0x380 => APIC.init_count,
+                0x390 => if APIC.init_count > 0 { APIC.init_count.wrapping_sub((loop_count & 0xFFFF) as u32) } else { 0x100000 },
+                _ => 0,
+            };
+            let bytes = val.to_le_bytes();
+            let len = data.len().min(4);
+            data[..len].copy_from_slice(&bytes[..len]);
         }
     }
 }
 
-enum LoopAction {
-    None,
-    Trace,
-    SerialOut(u8),
-    LogIoOut(u16, u8),
-    LogIoIn(u16),
-    LogMmioRead(u64),
-    LogMmioWrite(u64, u32),
-    LogOther(String),
-    Trap(u8),
-    Dump(String),
-    LogApic(u64, u32, bool),
+fn handle_mmio_write(addr: u64, data: &[u8]) {
+    if addr >= 0xfee00000 && addr <= 0xfee00fff {
+        unsafe {
+            let val = u32::from_le_bytes(data[0..4].try_into().unwrap_or([0;4]));
+            match addr & 0xFFF {
+                0x80 => APIC.tpr = val, 0xF0 => APIC.svr = val,
+                0x320 => APIC.lvt_timer = val, 0x380 => APIC.init_count = val,
+                _ => {}
+            }
+        }
+    }
 }
 
 fn setup_long_mode(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> Result<(), Box<dyn std::error::Error>> {
     let k_virt_base: u64 = 0xFFFFF80000000000;
-    let gdt_pbase: u64 = crate::SYSTEM_BASE;
+    let gdt_pbase: u64 = 0x8000000;
     let tss_pbase: u64 = gdt_pbase + 0x1000;
     let gdt_vbase = k_virt_base + gdt_pbase;
     let tss_vbase = k_virt_base + tss_pbase;
@@ -270,25 +180,14 @@ fn setup_long_mode(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> 
     
     let mut cpuid = vm.kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)?;
     for entry in cpuid.as_mut_slice() {
-        if entry.function == 0x1 { 
-            entry.ecx &= !(1 << 31); // Hypervisor present = 0
-            entry.ecx &= !(1 << 21); // x2APIC = 0
-        }
+        if entry.function == 0x1 { entry.ecx &= !(1 << 31); entry.ecx &= !(1 << 21); }
         if entry.function == 0x40000000 { entry.ebx = 0; entry.ecx = 0; entry.edx = 0; }
     }
     vm.vcpu_fd.set_cpuid2(&cpuid)?;
 
-    // GDT/TSS/Sregs 설정 (기존과 동일하게 유지하되 명세에 맞춤)
     let mut gdt: [u64; 32] = [0; 32];
-    gdt[1] = 0x00af9a000000ffff; 
-    gdt[2] = 0x00af9a000000ffff; 
-    gdt[3] = 0x00cf92000000ffff; 
-    gdt[4] = 0x00affb000000ffff; 
-    gdt[5] = 0x00cff3000000ffff; 
-    
-    // [CORE FIX] GDT Index 10 (Selector 0x50) 설정
-    // Windows 커널 초기화 시 필수적인 User Data Segment
-    gdt[10] = 0x00cff3000000ffff; 
+    gdt[1] = 0x00af9a000000ffff; gdt[2] = 0x00af9a000000ffff; gdt[3] = 0x00cf92000000ffff; 
+    gdt[4] = 0x00affb000000ffff; gdt[5] = 0x00cff3000000ffff; gdt[10] = 0x00cff3000000ffff; 
 
     let tss_limit = 104 - 1;
     let tss_low = (tss_vbase & 0xffffff) << 16 | (tss_vbase & 0xff000000) << 32 | 0x0000890000000000 | tss_limit;
@@ -342,5 +241,4 @@ fn setup_long_mode(vm: &mut Vm, krnl_entry_v: u64, stack_v: u64, lpb_v: u64) -> 
     regs.rdx = lpb_v; 
     vm.vcpu_fd.set_regs(&regs)?;
     Ok(())
-    
 }
