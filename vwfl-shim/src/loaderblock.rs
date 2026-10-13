@@ -203,10 +203,116 @@ pub struct KPCR {
     pub PcrAlign1: [ULONG; 24],                         // 0x118
 }
 
+struct Kpcr;
+impl Kpcr {
+    pub unsafe fn setup(gdt_v: PVOID) {
+
+        let kpcr = 0x40000 as *mut KPCR;
+
+        (*kpcr).MajorVersion = 10;
+        (*kpcr).MinorVersion = 19041;
+        (*kpcr).GdtBase = gdt_v; //and more!!! todo: i need to research about kernel structure structure's data & memory offset
+
+    }
+}
+
+#[repr(C)]
+pub struct LOADER_PARAMETER_BLOCK {
+    pub OsMajorVersion: ULONG,                           // 0x0 // to 10
+    pub OsMinorVersion: ULONG,                           // 0x4 // 19041?
+    pub Size: ULONG,                                     // 0x8 // core::mem::size_of::<LOADER_PARAMETER_BLOCK>() as u32;
+    pub OsLoaderSecurityVersion: ULONG,                  // 0xc
+    pub LoadOrderListHead: LIST_ENTRY,                   // 0x10
+    pub MemoryDescriptorListHead: LIST_ENTRY,            // 0x20 // i think I must gonna fill this field. right?
+    pub BootDriverListHead: LIST_ENTRY,                  // 0x30 // either too
+    pub EarlyLaunchListHead: LIST_ENTRY,                 // 0x40 // either too
+    pub CoreDriverListHead: LIST_ENTRY,                  // 0x50 // either too
+    pub CoreExtensionsDriverListHead: LIST_ENTRY,        // 0x60
+    pub TpmCoreDriverListHead: LIST_ENTRY,               // 0x70
+    pub KernelStack: ULONGLONG,                          // 0x80 // kernel_stack_v
+    pub Prcb: ULONGLONG,                                 // 0x88
+    pub Process: ULONGLONG,                              // 0x90
+    pub Thread: ULONGLONG,                               // 0x98
+    pub KernelStackSize: ULONG,                          // 0xa0
+    pub RegistryLength: ULONG,                           // 0xa4
+    pub RegistryBase: PVOID,                             // 0xa8
+    pub ConfigurationRoot: PVOID,                        // 0xb0
+    pub ArcBootDeviceName: PVOID,                        // 0xb8
+    pub ArcHalDeviceName: PVOID,                         // 0xc0
+    pub NtBootPathName: PVOID,                           // 0xc8
+    pub NtHalPathName: PVOID,                            // 0xd0
+    pub LoadOptions: PVOID,                              // 0xd8
+    pub NlsData: PVOID,                                  // 0xe0
+    pub ArcDiskInformation: PVOID,                       // 0xe8
+    pub Extension: PVOID,                                // 0xf0
+    pub u: [UCHAR; 16],                                  // 0xf8
+    pub FirmwareInformation: [UCHAR; 64],                // 0x108
+    pub OsBootstatPathName: PVOID,                       // 0x148
+    pub ArcOSDataDeviceName: PVOID,                      // 0x150
+    pub ArcWindowsSysPartName: PVOID,                    // 0x158
+}
+
 // 0x400000 대역에 Loaderblock을 배치해야 한다.
 
-pub struct Kpcr;
+pub struct LoaderParameterBlock;
 
-impl Kpcr {
-    let lpb 0x40000 as *mut LOADER_PARAMETER_BLOCK;
+impl LoaderParameterBlock {
+
+    pub unsafe fn setup(stack_v: u64, stack_size: ULONG, prcb_v: ULONGLONG) {
+
+        let lpb = 0x40000 as *mut LOADER_PARAMETER_BLOCK;
+
+            (*lpb).OsMajorVersion = 10;
+            (*lpb).OsMinorVersion = 19041;
+            (*lpb).Size = size_of::<LOADER_PARAMETER_BLOCK>() as u32;
+            (*lpb).KernelStack = stack_v;
+            (*lpb).KernelStackSize = stack_size;
+            (*lpb).Prcb = prcb_v;
+            (*lpb).LoadOptions = stack_v + 0xC000u64;
+            (*lpb).Extension = stack_v + 0xe38;
+
+
+    }
+}
+
+
+/// _LOADER_PARAMETER_EXTENSION - 0xe38 bytes
+#[repr(C)]
+pub struct LOADER_PARAMETER_EXTENSION {
+    pub Size: ULONG,                                    // 0x0
+    pub Profile: [UCHAR; 0x14],                         // 0x4
+    pub EmInfFileImage: PVOID,                          // 0x18
+    pub EmInfFileSize: ULONG,                           // 0x20
+    pub TriageDumpBlock: PVOID,                         // 0x28
+    pub HeadlessLoaderBlock: PVOID,                     // 0x30
+    pub SMBiosEPSHeader: PVOID,                         // 0x38
+    pub DrvDBImage: PVOID,                              // 0x40
+    pub DrvDBSize: ULONG,                               // 0x48
+    pub DrvDBPatchImage: PVOID,                         // 0x50
+    pub DrvDBPatchSize: ULONG,                          // 0x58
+    pub NetworkLoaderBlock: PVOID,                      // 0x60
+    pub FirmwareDescriptorListHead: LIST_ENTRY,         // 0x68
+    pub AcpiTable: PVOID,                               // 0x78
+    pub AcpiTableSize: ULONG,                           // 0x80
+    pub Bitfields: ULONG,                               // 0x84
+    pub LoaderPerformanceData: [UCHAR; 0x60],           // 0x88
+    pub BootApplicationPersistentData: LIST_ENTRY,      // 0xe8
+    pub Padding1: [UCHAR; 0x8D0],                       // 0xF8 -> 0x9C8
+    pub ProcessorCounterFrequency: ULONGLONG,           // 0x9c0
+    pub HypervisorExtension: [UCHAR; 0x40],             // 0x9c8
+    pub HardwareConfigurationId: [UCHAR; 16],           // 0xa08
+    pub HalExtensionModuleList: LIST_ENTRY,             // 0xa18
+    pub SystemTime: ULONGLONG,                          // 0xa28
+    pub TimeStampAtSystemTimeRead: ULONGLONG,           // 0xa30
+    pub BootFlags: ULONGLONG,                           // 0xa38
+    pub InternalBootFlags: ULONGLONG,                   // 0xa40
+    pub WfsFPData: PVOID,                               // 0xa48
+    pub WfsFPDataSize: ULONG,                           // 0xa50
+    pub BugcheckParameters: [UCHAR; 0x28],              // 0xa58
+    pub ApiSetSchema: PVOID,                            // 0xa80
+    pub ApiSetSchemaSize: ULONG,                        // 0xa88
+    pub ApiSetSchemaExtensions: LIST_ENTRY,             // 0xa90
+    pub PaddingFinal: [UCHAR; 0x390],                   // 0xaa0 -> 0xe30
+    pub MajorRelease: ULONG,                            // 0xb88
+    pub MinorRelease: ULONG,                            // 0xb8c
 }

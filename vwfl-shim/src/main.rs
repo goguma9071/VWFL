@@ -1,8 +1,10 @@
 #![no_std]
 #![no_main]
+extern crate alloc;
 
 mod loaderblock;
 mod nt_types;
+mod redsea;
 
 use core::panic::PanicInfo;
 use core::arch::asm;

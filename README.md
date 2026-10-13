@@ -12,26 +12,27 @@ KVM을 활용하여 윈도우를 가상화 시킵니다.
 그곳에 다음의 파일을 집어넣어야 합니다.
 ```
 Window 10 Build 19041을 기준으로 합니다.
-ntoskrnl.exe
-hal.dll
-ci.dll
-BOOTVID.DLL
-PSHED.DLL
-kd.dll
-kdcom.dll
-HalExtIntcLpioDMA.dll
-HalExtPL080.dll
-msasn1.dll
-msisadrv.sys
-acpi.sys
-clfs.sys
+HalExtIntcLpioDMA.dll  
+ci.dll    
+kdcom.dll     
 pci.sys
+HalExtPL080.dll        
+clfs.sys  
+l_intl.nls    
 pciidex.sys
+BOOTVID.DLL  
+PSHED.DLL 
+/.config/    
+msasn1.dll
+C_1252.NLS  
+acpi.sys               
+hal.dll   
+msisadrv.sys
 C_437.NLS
-C_1252.NLS
-l_intl.nls
-(이 외에 더 추가 될 수 있음)
-/config/
+apisetschema.dll       
+kd.dll    
+ntoskrnl.exe
+
 ```
 위의 모든 파일과 폴더는 윈도우 10 설치 미디어(ISO)에 있습니다.
 iso 파일을 압축관리자로 여시고, 검색에서 install.wim이라는 파일만을 따로 추출하십시오.

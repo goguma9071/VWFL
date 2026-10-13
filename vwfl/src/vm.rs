@@ -9,18 +9,16 @@ pub const MMIO_HOLE_START: u64 = 0xC0000000; // 3GB
 pub const MMIO_HOLE_SIZE: u64 = 0x40000000;  // 1GB (Hole until 4GB)
 
 pub struct Vm {
-    #[allow(dead_code)]
     pub kvm: Kvm,
-    #[allow(dead_code)]
     pub vm_fd: VmFd,
     pub vcpu_fd: VcpuFd,
     pub mem_ptr: *mut u8, 
     pub mem_size: usize,
 }
 
-impl Drop for Vm {
+impl Drop for Vm { // What this code means?
     fn drop(&mut self) {
-        unsafe { libc::munmap(self.mem_ptr as *mut libc::c_void, self.mem_size); }
+        unsafe { libc::munmap(self.mem_ptr as *mut libc::c_void, self.mem_size); } // Return the whole memory to Host.
     }
 }
 
